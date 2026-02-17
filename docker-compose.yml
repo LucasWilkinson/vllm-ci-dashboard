@@ -1,0 +1,23 @@
+services:
+  ci-bot:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ~/.config/gh:/root/.config/gh:ro
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/ci-bot.db
+      - BUILDKITE_API_TOKEN=${BUILDKITE_API_TOKEN:-}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      # Claude Code via Vertex AI
+      - CLAUDE_CODE_USE_VERTEX=1
+      - CLOUD_ML_REGION=us-east5
+      - ANTHROPIC_VERTEX_PROJECT_ID=itpc-gcp-ai-eng-claude
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
