@@ -1,5 +1,5 @@
 from app.models.build import Build, Job
-from app.models.failure import Failure, ErrorSignature
+from app.models.failure import Failure, ErrorSignature, KnownFailure
 from app.models.github import GitHubIssue, FailureIssueLink
 
 __all__ = [
@@ -7,6 +7,7 @@ __all__ = [
     "Job",
     "Failure",
     "ErrorSignature",
+    "KnownFailure",
     "GitHubIssue",
     "FailureIssueLink",
 ]

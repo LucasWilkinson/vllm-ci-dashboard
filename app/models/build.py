@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -18,6 +18,7 @@ class Build(Base):
     web_url: Mapped[str | None] = mapped_column(String(500))
     triage_status: Mapped[str] = mapped_column(String(50), default="pending")
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    buildkite_build_id: Mapped[str | None] = mapped_column(String(100))
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     jobs: Mapped[list["Job"]] = relationship("Job", back_populates="build", cascade="all, delete-orphan")
@@ -34,7 +35,12 @@ class Job(Base):
     step_key: Mapped[str | None] = mapped_column(String(255))
     web_url: Mapped[str | None] = mapped_column(String(500))
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    command: Mapped[str | None] = mapped_column(Text)
     soft_failed: Mapped[bool] = mapped_column(Boolean, default=False)
+    retry_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    exit_status: Mapped[int | None] = mapped_column(Integer)
+    signal: Mapped[str | None] = mapped_column(String(100))
+    signal_reason: Mapped[str | None] = mapped_column(String(100))
 
     build: Mapped["Build"] = relationship("Build", back_populates="jobs")
     # One job can have multiple distinct failures (different test failures with different root causes)

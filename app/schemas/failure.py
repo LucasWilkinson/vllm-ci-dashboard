@@ -17,6 +17,7 @@ class FailureResponse(FailureBase):
 
     id: int
     job_id: int
+    retry_passed: bool = False
     log_excerpt: str | None = None
 
     @field_validator("failing_test", mode="before")

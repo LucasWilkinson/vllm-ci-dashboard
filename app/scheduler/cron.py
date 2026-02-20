@@ -5,19 +5,12 @@ scheduler = AsyncIOScheduler()
 
 
 async def sync_builds_job():
-    from app.services.buildkite import BuildkiteService
     from app.services.triage import TriageService
     from app.database import async_session_maker
 
     async with async_session_maker() as session:
-        buildkite_service = BuildkiteService()
         triage_service = TriageService(session)
-
-        builds = await buildkite_service.list_recent_builds(limit=10)
-        for build_data in builds:
-            if build_data.get("state") == "failed":
-                await triage_service.sync_and_triage_build(build_data)
-        await session.commit()
+        await triage_service.sync_recent_builds(limit=10)
 
 
 async def sync_github_issues_job():

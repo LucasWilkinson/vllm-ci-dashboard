@@ -18,7 +18,7 @@ class JobResponse(JobBase):
 
     id: int
     build_id: int
-    failure: FailureResponse | None = None
+    failures: list[FailureResponse] = []
 
 
 class BuildBase(BaseModel):
@@ -45,77 +45,6 @@ class BuildResponse(BuildBase):
     jobs: list[JobResponse] = []
 
 
-class BuildSummary(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    buildkite_build_number: int
-    build_type: str | None = None
-    state: str | None = None
-    branch: str | None = None
-    message: str | None = None
-    web_url: str | None = None
-    triage_status: str
-    created_at: datetime | None = None
-    total_jobs: int = 0
-    failed_jobs: int = 0
-    infra_failures: int = 0
-    test_failures: int = 0
-
-
-class DashboardSummary(BaseModel):
-    total_builds: int
-    pending_triages: int
-    completed_triages: int
-    infra_failures_today: int
-    test_failures_today: int
-
-
-class FailingBuildInfo(BaseModel):
-    """Info about a build where a test failed."""
-    build_number: int
-    commit_sha: str | None
-    build_url: str | None
-    job_url: str | None
-
-
-class CurrentIssue(BaseModel):
-    """A test failure that is still broken (hasn't passed on main since failing)."""
-    failure_id: int
-    job_id: int
-    job_name: str
-    job_url: str | None = None
-    failing_test: str | list[str] | None
-    failure_type: str | None
-    error_message: str | None
-    error_signature: str | None
-    log_excerpt: str | None = None
-    first_seen_build: int
-    last_seen_build: int
-    occurrence_count: int
-    is_flaky: bool = False
-    flaky_rate: float | None = None
-    retry_success_count: int | None = None
-    signature_occurrence_count: int | None = None
-    linked_issue_number: int | None = None
-    linked_issue_url: str | None = None
-    resolved_by_pr: int | None = None
-    failing_builds: list[FailingBuildInfo] = []
-
-
-class CurrentIssueGroup(BaseModel):
-    """A group of current issues with the same root cause error."""
-    error_key: str
-    error_message: str | None
-    failure_type: str | None
-    linked_issue_number: int | None = None
-    linked_issue_url: str | None = None
-    total_affected_tests: int
-    first_seen_build: int
-    last_seen_build: int
-    issues: list[CurrentIssue]
-
-
 class FailedJobSummary(BaseModel):
     job_id: int
     failure_id: int | None = None
@@ -128,7 +57,9 @@ class FailedJobSummary(BaseModel):
     error_signature: str | None = None
     error_message: str | None
     log_excerpt: str | None = None
-    is_flaky: bool
+    flaky_status: str | None = None
+    known_failure_id: int | None = None
+    known_failure_title: str | None = None
     linked_issue_number: int | None = None
     linked_issue_state: str | None = None
     linked_issue_url: str | None = None
@@ -148,4 +79,25 @@ class BuildWithFailures(BaseModel):
     triage_status: str
     created_at: datetime | None = None
     total_jobs: int = 0
+    failed_jobs: list[FailedJobSummary] = []
+
+
+class BuildInTimeline(BaseModel):
+    build_number: int
+    build_type: str | None = None
+    state: str | None = None
+    web_url: str | None = None
+    triage_status: str
+    total_jobs: int = 0
+    failed_job_count: int = 0
+    passed_job_count: int = 0
+    not_run_job_count: int = 0
+
+
+class CommitTimelineEntry(BaseModel):
+    commit_sha: str | None = None
+    message: str | None = None
+    created_at: datetime | None = None
+    status: str  # worst aggregate state across builds
+    builds: list[BuildInTimeline] = []
     failed_jobs: list[FailedJobSummary] = []

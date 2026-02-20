@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, Build, Job, FailureSuggestion } from '../api/client'
+import LogSnippet from './LogSnippet'
 
 function CategoryBadge({ category }: { category: string | null }) {
   if (category === 'infra') {
@@ -199,7 +200,8 @@ function JobCard({ job, buildNumber }: { job: Job; buildNumber: number }) {
     },
   })
 
-  const failure = job.failure
+  const failures = job.failures || []
+  const firstFailure = failures[0] || null
 
   return (
     <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
@@ -210,9 +212,15 @@ function JobCard({ job, buildNumber }: { job: Job; buildNumber: number }) {
         <div className="flex items-center space-x-3">
           <StateBadge state={job.state} />
           <span className="text-white font-medium">{job.name || job.step_key}</span>
-          {failure && <CategoryBadge category={failure.failure_category} />}
-          {failure?.is_flaky && (
-            <span className="text-yellow-400 text-xs">(flaky)</span>
+          {firstFailure && <CategoryBadge category={firstFailure.failure_category} />}
+          {firstFailure?.retry_passed && (
+            <span className="text-green-400 text-xs">(flaky)</span>
+          )}
+          {!firstFailure?.retry_passed && firstFailure?.is_flaky && (
+            <span className="text-yellow-400 text-xs">(likely flaky)</span>
+          )}
+          {failures.length > 1 && (
+            <span className="text-gray-400 text-xs">({failures.length} failures)</span>
           )}
         </div>
         <div className="flex items-center space-x-2">
@@ -223,28 +231,38 @@ function JobCard({ job, buildNumber }: { job: Job; buildNumber: number }) {
         </div>
       </div>
 
-      {expanded && failure && (
+      {expanded && failures.length > 0 && (
         <div className="border-t border-gray-700 p-4 space-y-4">
-          <div>
-            <h4 className="text-sm font-medium text-gray-400 mb-1">Error Message</h4>
-            <p className="text-red-300 text-sm">{failure.error_message}</p>
-          </div>
+          {failures.map((failure, idx) => (
+            <div key={failure.id} className={idx > 0 ? 'border-t border-gray-700 pt-4' : ''}>
+              {failures.length > 1 && (
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-gray-500 text-xs">Failure {idx + 1}/{failures.length}</span>
+                  <CategoryBadge category={failure.failure_category} />
+                </div>
+              )}
+              <div>
+                <h4 className="text-sm font-medium text-gray-400 mb-1">Error Message</h4>
+                <p className="text-red-300 text-sm">{failure.error_message}</p>
+              </div>
 
-          {failure.root_cause && (
-            <div>
-              <h4 className="text-sm font-medium text-gray-400 mb-1">Root Cause</h4>
-              <p className="text-gray-300 text-sm">{failure.root_cause}</p>
-            </div>
-          )}
+              {failure.root_cause && (
+                <div className="mt-2">
+                  <h4 className="text-sm font-medium text-gray-400 mb-1">Root Cause</h4>
+                  <p className="text-gray-300 text-sm">{failure.root_cause}</p>
+                </div>
+              )}
 
-          {failure.log_excerpt && (
-            <div>
-              <h4 className="text-sm font-medium text-gray-400 mb-1">Log Excerpt</h4>
-              <pre className="bg-gray-900 p-3 rounded text-xs text-gray-300 overflow-x-auto max-h-48">
-                {failure.log_excerpt.slice(-2000)}
-              </pre>
+              {failure.log_excerpt && (
+                <div className="mt-2">
+                  <h4 className="text-sm font-medium text-gray-400 mb-1">Log Excerpt</h4>
+                  <LogSnippet log={failure.log_excerpt.slice(-2000)} />
+                </div>
+              )}
+
+              <SuggestionsPanel failureId={failure.id} />
             </div>
-          )}
+          ))}
 
           <div className="flex items-center space-x-3">
             <button
@@ -279,15 +297,13 @@ function JobCard({ job, buildNumber }: { job: Job; buildNumber: number }) {
             )}
           </div>
 
-          <SuggestionsPanel failureId={failure.id} />
-
-          {showCreateIssue && (
+          {showCreateIssue && firstFailure && (
             <CreateIssueForm
-              failureId={failure.id}
+              failureId={firstFailure.id}
               jobName={job.name || job.step_key || 'unknown'}
               stepKey={job.step_key}
-              errorMessage={failure.error_message || 'No error message'}
-              rootCause={failure.root_cause}
+              errorMessage={firstFailure.error_message || 'No error message'}
+              rootCause={firstFailure.root_cause}
               buildNumber={buildNumber}
               jobUrl={job.web_url}
               onClose={() => setShowCreateIssue(false)}

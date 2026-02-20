@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     buildkite_org: str = "vllm"
     buildkite_pipeline: str = "ci"
     buildkite_api_token: str | None = None
-
-    slack_webhook_url: str | None = None
+    buildkite_webhook_token: str | None = None
+    buildkite_test_suite: str = "ci-1"
 
     claude_code_use_vertex: bool = True
     cloud_ml_region: str = "us-east5"

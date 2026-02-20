@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime
 from difflib import SequenceMatcher
 
 from sqlalchemy import select
@@ -17,12 +16,12 @@ class PatternMatcher:
         self.session = session
 
     async def find_similar_failures(
-        self, failure: Failure, min_issue_created_at: datetime | None = None, limit: int = 5
+        self, failure: Failure, limit: int = 5
     ) -> list[dict]:
         suggestions = []
 
         if failure.error_signature:
-            exact_matches = await self._find_by_signature(failure.error_signature, min_issue_created_at)
+            exact_matches = await self._find_by_signature(failure.error_signature)
             for match in exact_matches:
                 if match["github_issue"] and match["github_issue"] not in [
                     s["github_issue"] for s in suggestions
@@ -35,7 +34,7 @@ class PatternMatcher:
 
         if failure.error_message and len(suggestions) < limit:
             fuzzy_matches = await self._find_by_error_message(
-                failure.error_message, min_issue_created_at, limit - len(suggestions)
+                failure.error_message, limit - len(suggestions)
             )
             for match in fuzzy_matches:
                 if match["github_issue"] and match["github_issue"] not in [
@@ -45,7 +44,7 @@ class PatternMatcher:
 
         return suggestions[:limit]
 
-    async def _find_by_signature(self, signature: str, min_issue_created_at: datetime | None = None) -> list[dict]:
+    async def _find_by_signature(self, signature: str) -> list[dict]:
         stmt = (
             select(ErrorSignature)
             .where(ErrorSignature.signature_hash == signature)
@@ -58,10 +57,6 @@ class PatternMatcher:
         matches = []
         for error_sig in error_sigs:
             if error_sig.associated_issue:
-                # Filter by issue creation date if specified
-                if min_issue_created_at and error_sig.associated_issue.created_at:
-                    if error_sig.associated_issue.created_at < min_issue_created_at:
-                        continue
                 matches.append({
                     "github_issue": error_sig.associated_issue,
                     "occurrence_count": error_sig.occurrence_count,
@@ -69,7 +64,7 @@ class PatternMatcher:
         return matches
 
     async def _find_by_error_message(
-        self, error_message: str, min_issue_created_at: datetime | None = None, limit: int = 5
+        self, error_message: str, limit: int = 5
     ) -> list[dict]:
         stmt = (
             select(Failure)
@@ -91,10 +86,6 @@ class PatternMatcher:
 
             if similarity > 0.6:
                 for link in hist_failure.issue_links:
-                    # Filter by issue creation date if specified
-                    if min_issue_created_at and link.github_issue and link.github_issue.created_at:
-                        if link.github_issue.created_at < min_issue_created_at:
-                            continue
                     scored_matches.append({
                         "github_issue": link.github_issue,
                         "similarity_score": similarity,
@@ -226,8 +217,10 @@ class PatternMatcher:
 
         return suggestions[:limit]
 
-    async def get_suggestions_for_failure(self, failure_id: int) -> list[dict]:
-        # Load failure with job and build to get build's created_at
+    async def get_suggestions_for_failure(
+        self, failure_id: int
+    ) -> list[dict]:
+        # Load failure with job and build
         stmt = (
             select(Failure)
             .where(Failure.id == failure_id)
@@ -260,12 +253,7 @@ class PatternMatcher:
                         "match_reason": match["match_reason"],
                     })
 
-        # Then look for signature/message matches
-        min_issue_created_at = None
-        if failure.job and failure.job.build and failure.job.build.created_at:
-            min_issue_created_at = failure.job.build.created_at
-
-        similar = await self.find_similar_failures(failure, min_issue_created_at)
+        similar = await self.find_similar_failures(failure)
 
         for match in similar:
             issue = match["github_issue"]

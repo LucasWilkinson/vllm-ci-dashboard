@@ -19,9 +19,6 @@ class FailureUpdate(BaseModel):
     is_flaky: bool | None = None
 
 
-class ResolvedByPRRequest(BaseModel):
-    pr_number: int
-
 
 @router.get("/failures/{failure_id}", response_model=FailureResponse)
 async def get_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
@@ -40,7 +37,10 @@ async def get_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/failures/{failure_id}/suggestions", response_model=list[FailureSuggestion])
-async def get_failure_suggestions(failure_id: int, db: AsyncSession = Depends(get_db)):
+async def get_failure_suggestions(
+    failure_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     pattern_matcher = PatternMatcher(db)
     suggestions = await pattern_matcher.get_suggestions_for_failure(failure_id)
     return suggestions
@@ -92,44 +92,3 @@ async def retriage_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
     return new_failure
 
 
-@router.post("/failures/{failure_id}/resolved-by-pr")
-async def mark_resolved_by_pr(
-    failure_id: int,
-    request: ResolvedByPRRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """Mark a failure as resolved by a PR."""
-    stmt = select(Failure).where(Failure.id == failure_id)
-    result = await db.execute(stmt)
-    failure = result.scalar_one_or_none()
-
-    if not failure:
-        raise HTTPException(status_code=404, detail="Failure not found")
-
-    failure.resolved_by_pr = request.pr_number
-    await db.commit()
-
-    return {
-        "message": f"Marked failure as resolved by PR #{request.pr_number}",
-        "failure_id": failure_id,
-        "resolved_by_pr": request.pr_number,
-    }
-
-
-@router.delete("/failures/{failure_id}/resolved-by-pr")
-async def unmark_resolved_by_pr(
-    failure_id: int,
-    db: AsyncSession = Depends(get_db),
-):
-    """Remove resolved by PR marking from a failure."""
-    stmt = select(Failure).where(Failure.id == failure_id)
-    result = await db.execute(stmt)
-    failure = result.scalar_one_or_none()
-
-    if not failure:
-        raise HTTPException(status_code=404, detail="Failure not found")
-
-    failure.resolved_by_pr = None
-    await db.commit()
-
-    return {"message": "Removed resolved by PR marking", "failure_id": failure_id}

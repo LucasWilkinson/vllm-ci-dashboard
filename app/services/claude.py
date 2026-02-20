@@ -6,169 +6,200 @@ import re
 
 logger = logging.getLogger(__name__)
 
-TRIAGE_PROMPT = """Analyze this CI job log from vLLM and categorize failures.
+TRIAGE_PROMPT = """Analyze this CI job log from vLLM and identify test failures.
 
-CRITICAL - FIND THE ROOT CAUSE:
-The log is organized into sections labeled "FIRST ERROR" (usually the root cause), "FINAL ERROR" (cascading failures), and "FINAL OUTPUT" (test summary).
+NOTE: Pre-execution infrastructure failures (agent lost, pod eviction, etc.) are already
+handled before this analysis runs. You are only seeing jobs where the process actually
+started — focus on understanding what failed and why.
 
-**ALWAYS prioritize errors from "FIRST ERROR" section** - these are the actual root causes. Errors in later sections like "RuntimeError: Engine core initialization failed" or "Server exited unexpectedly" are WRAPPER ERRORS caused by the first error.
+CONTEXT:
+vLLM is a distributed GPU inference engine. Tests run multiprocess workers (GPU ranks).
+When a worker crashes, errors cascade through MANY layers: GPU error -> worker dies ->
+engine init fails -> server exits -> test assertion fails. Between multiprocessing and
+torch.compile, there can be MANY cascading exceptions wrapping the original error.
 
-Return an ARRAY of failure objects - one per DISTINCT root cause.
+CRITICAL — TRACE EXCEPTION CHAINS:
+You MUST trace through the ENTIRE exception chain to find the DEEPEST root cause. The
+first traceback you see may itself be a wrapper. Look for:
+- "During handling of the above exception, another exception occurred"
+- "The above exception was the direct cause of the following exception"
+- Subprocess error logs: "(EngineCore_DP0 pid=XXXXX) ERROR ... File ..."
+- Re-raised exceptions in multiprocess workers
 
-Return ONLY valid JSON array (no markdown). Each object has:
-- category: "infra" or "test"
-- failing_test: Test path (e.g., "v1/test_foo.py::test_bar"). Null for infra issues.
-- error_signature: Format "test_file::test_name:ErrorType:specific_detail" - must be unique to this failure
-- error_message: THE ACTUAL ROOT CAUSE (quote from FIRST ERROR section, not wrapper errors)
-- root_cause: 1-2 sentence explanation
-- is_flaky: boolean
+The DEEPEST exception in the chain is the root cause. For example,
+"assert not inplace or not disable_inplace()" in fused_moe.py is more useful than
+"Engine core initialization failed" which wraps it 3 layers up.
 
-WRAPPER ERRORS TO SKIP (use earlier error instead):
+WRAPPER ERRORS TO SKIP (trace through to find the error they wrap):
 - "Engine core initialization failed"
 - "Server exited unexpectedly"
-- "See root cause above"
-- "command exited with status"
-- "Failed core proc"
+- "Failed to start engine", "Worker failed to start"
+- "process group initialization failed"
+- "See root cause above", "command exited with status", "Failed core proc"
+These are NEVER the root cause. Always look for the deeper error they wrap.
 
-Categories:
-- "infra": Docker issues, network/HTTP errors, NCCL errors, timeouts, OSError (resource unavailable), platform unsupported features
-- "test": AssertionError, accuracy failures, OOM/memory errors (could be test bug), ValueError in test code
+TORCH.COMPILE / DYNAMO ERRORS:
+torch._dynamo.exc.Observed*Error (ObservedAssertionErrorError, ObservedAttributeError, etc.)
+are wrappers around errors that occurred inside a torch.compile'd function. The exception
+class name alone is NOT informative. To find the actual root cause:
+- Look for "Developer debug context:" lines — these contain the REAL error message
+  (e.g., "'ZeroExpertFusedMoE' object has no attribute 'select_experts'")
+- Look for subprocess output from "(EngineCore_DP0 pid=...)" which often contains
+  the full traceback before torch._dynamo wraps it
+- The error_message should describe the ACTUAL underlying error, not the Observed*Error wrapper
+- Example: error_message should be "AttributeError: 'ZeroExpertFusedMoE' object has no
+  attribute 'select_experts'" NOT "torch._dynamo.exc.ObservedAttributeError: raised exception"
 
-Examples:
-[{{"category": "infra", "failing_test": null, "error_signature": "infra:OSError:resource_temporarily_unavailable", "error_message": "OSError: [Errno 11] Resource temporarily unavailable", "root_cause": "System resource exhaustion", "is_flaky": true}}]
+TEST TYPES:
+Most vLLM CI jobs run pytest, but some run custom scripts (bash, standalone Python for
+benchmarks/accuracy evals). For pytest jobs, look for "PASSED", "FAILED", "ERROR",
+traceback blocks, and the pytest summary at the end. For non-pytest jobs, look for exit
+codes, assertion messages in stdout, and script-specific error output.
 
-[{{"category": "test", "failing_test": "test_voxtral.py::test_online_serving", "error_signature": "test_voxtral.py::test_online_serving:ValueError:gpu_memory", "error_message": "ValueError: Free memory (1.5 GiB) < required (4.0 GiB) on cuda:0", "root_cause": "Test requires more GPU memory than available - may need model/batch size adjustment", "is_flaky": false}}]
+vLLM CI may run multiple test files sequentially in the same job. Each distinct test
+failure should be a separate entry in the output array. Check file paths in tracebacks
+to separate failures from different tests.
 
-Log content:
-{log_content}
+LOG ANALYSIS STRATEGY:
+1. Read the LAST 50 lines for the pytest summary (pass/fail counts, test names)
+2. Grep for "FAILED " to find which tests failed
+3. Grep for "Traceback" to locate all error tracebacks
+4. Read around error tracebacks to understand each failure
+5. For wrapper errors, grep EARLIER for the actual root cause
+6. For torch._dynamo Observed*Error, grep for "Developer debug context:"
+7. Grep for "E   " (pytest assertion lines) to find assertion failures
+
+KNOWN FAILURES (existing tracked issues):
+{known_failures_context}
+
+LOG FILE TO ANALYZE:
+{log_file}
+
+{tc_context}
+
+For each failure, assign it to either:
+1. An existing known failure (by known_failure_id) if the root cause matches
+2. A new known failure (provide title, summary, match_prompt, category) if genuinely new
+
+Return ONLY valid JSON array (no markdown). Each object has:
+- known_failure_id: <int or null> — set if this matches an existing known failure
+- new_known_failure: {{"title": "...", "summary": "...", "match_prompt": "...", "category": "infra" or "test"}} or null
+- failing_test: Test path (e.g., "v1/test_foo.py::test_bar"). Null for infra issues.
+- error_signature: Format "test_file::test_name:ErrorType:specific_detail" — must be unique
+- error_message: THE DEEPEST ROOT CAUSE error — trace through ALL exception chains
+- root_cause: 1-2 sentence explanation
+- log_line_start: Starting line number for the root cause traceback
+- log_line_end: Ending line number. Pick a 20-40 line range showing the deepest error.
+  For wrapper errors, point to the ACTUAL root cause. For torch._dynamo errors, include
+  the "Developer debug context:" line.
+
+WRITING match_prompt (for new_known_failure):
+- Describe the ROOT CAUSE error pattern, NOT wrapper errors
+- Include: root cause error type, originating file/module, key error message fragments
+- Exclude: wrapper errors (Observed*Error, "Engine core initialization failed", etc.),
+  specific parameter values, timestamps, memory addresses, rank numbers
+- DO NOT name specific test files UNLESS the failure is truly test-specific (e.g., an
+  accuracy regression in a specific test). For infra issues, timeouts, OOM, NCCL errors,
+  etc., describe the ERROR PATTERN, not which tests happened to be running.
+- Example GOOD: "torch.OutOfMemoryError during model weight loading in linear.py, CUDA
+  out of memory when allocating weight tensors for large models"
+- Example BAD: "torch._dynamo.exc.ObservedAssertionErrorError with wrapper message"
+  (describes the wrapper, not the root cause)
+- Example BAD: "signal: terminated during pytest startup for test_block_fp8.py"
+  (names specific test files for a timeout). Instead: "Job timeout during pytest
+  initialization, cancellation signal before tests execute"
+- Goal: match all failures from the same root cause, even across different tests
+
+GROUPING:
+Multiple test cases that fail with the same root cause = ONE known failure. The question
+is: would a single code fix resolve all of them? Each test case is still a separate entry
+in the output array, but they all reference the same new_known_failure title.
+
+CATEGORIES:
+- "infra": Docker issues, network/HTTP errors, NCCL errors, OSError (resource unavailable),
+  platform unsupported features, OOM during model weight loading (GPU too small for model),
+  timeouts where no test started (setup/docker/init)
+- "test": AssertionError, accuracy failures, ValueError in test code, OOM AFTER weight
+  loading (profiling/KV cache/forward pass — likely code regression increased memory),
+  CUDA re-initialization errors (vLLM is multiprocess — driver communication bugs are
+  real), timeouts where a test was running and hung (compilation stuck, deadlock)
+
+OOM CATEGORIZATION:
+- OOM during weight loading / model initialization → "infra" (GPU too small for model)
+- OOM after weights are loaded (profiling, KV cache, forward pass) → "test" (code regression)
+
+TIMEOUTS/CANCELLATIONS:
+- "Received cancellation signal" or "signal: terminated" means the job timed out
+- If no tests started (timeout during setup/init/docker) → "infra", failing_test = null
+- If a test was running and appears to have hung → "test", set failing_test to last test
+- Do NOT reference specific test files in match_prompt for timeouts — describe the pattern
 """
 
 
-def _extract_relevant_log_sections(log_content: str, max_size: int = 60000) -> str:
-    """Extract relevant error sections from the log, not just the last N chars.
+def _build_tc_context_text(tc_executions: list[dict] | None) -> str:
+    """Build Test Engine context string for prompts."""
+    if not tc_executions:
+        return ""
 
-    This finds error/exception lines and includes context around them,
-    ensuring we capture root cause errors that may occur earlier in the log.
-    """
-    lines = log_content.split('\n')
-
-    # Wrapper errors that are NOT informative (skip these when finding "first error")
-    wrapper_patterns = [
-        'Engine core initialization failed',
-        'Server exited unexpectedly',
-        'See root cause above',
-        'command exited with status',
-        'Failed core proc',
-        'subprocess.*failed',
+    lines = [
+        "TEST ENGINE DATA (from Buildkite Test Analytics):",
+        "The following tests FAILED according to the test runner. Use this to focus",
+        "your analysis — you know exactly which tests failed. Search the raw log for",
+        "the full execution output of each failed test (subprocess logs, CUDA errors,",
+        "worker messages). The tracebacks below may be truncated; the raw log has the",
+        "full output.",
+        "",
     ]
+    for i, ex in enumerate(tc_executions, 1):
+        test_name = ex.get("test_name", "unknown")
+        location = ex.get("location", "")
+        failure_reason = ex.get("failure_reason", "")
+        # Truncate failure_reason for prompt (it may already be truncated at 1024 chars)
+        if len(failure_reason) > 500:
+            failure_reason = failure_reason[:500] + "... [truncated — check raw log for full traceback]"
+        lines.append(f"  Failed test {i}: {test_name}")
+        if location:
+            lines.append(f"    Location: {location}")
+        if failure_reason:
+            lines.append(f"    Traceback hint:\n      {failure_reason}")
+        lines.append("")
 
-    def is_wrapper_error(line: str) -> bool:
-        return any(p in line for p in wrapper_patterns)
-
-    # Patterns that indicate REAL root cause errors (not pytest output)
-    real_error_patterns = [
-        'ValueError:',
-        'RuntimeError:',
-        'AssertionError:',
-        'KeyError:',
-        'TypeError:',
-        'ImportError:',
-        'ModuleNotFoundError:',
-        'FileNotFoundError:',
-        'ConnectionError:',
-        'TimeoutError:',
-        'MemoryError:',
-        'OutOfMemoryError',
-        'CUDA error',
-        'NCCL error',
-        'HTTPError:',
-        'raise ValueError',
-        'raise RuntimeError',
-        'raise AssertionError',
-        'Traceback (most recent call last)',
-    ]
-
-    def is_real_error(line: str) -> bool:
-        return any(p in line for p in real_error_patterns)
-
-    # Find all lines with real errors/exceptions (not wrappers, not just "FAILED" output)
-    error_indices = []
-    for i, line in enumerate(lines):
-        if is_real_error(line) and not is_wrapper_error(line):
-            error_indices.append(i)
-
-    # Also find wrapper errors separately (to show as context)
-    wrapper_indices = []
-    for i, line in enumerate(lines):
-        if is_wrapper_error(line):
-            wrapper_indices.append(i)
-
-    if not error_indices and not wrapper_indices:
-        # No errors found, just return last portion
-        return log_content[-max_size:] if len(log_content) > max_size else log_content
-
-    sections = []
-
-    # First REAL error section (the root cause) - get substantial context
-    if error_indices:
-        first_idx = error_indices[0]
-        start = max(0, first_idx - 5)  # Some context before
-        end = min(len(lines), first_idx + 50)  # Lots of context after to capture full traceback
-        sections.append(('FIRST ERROR (ROOT CAUSE)', lines[start:end]))
-
-    # If there's a gap, show middle errors too
-    if len(error_indices) > 2:
-        mid_idx = error_indices[len(error_indices) // 2]
-        if mid_idx - error_indices[0] > 50:
-            start = max(0, mid_idx - 5)
-            end = min(len(lines), mid_idx + 15)
-            sections.append(('MIDDLE ERROR', lines[start:end]))
-
-    # Final error section (cascading failures / wrapper errors)
-    if wrapper_indices:
-        last_wrapper_idx = wrapper_indices[-1]
-        if not error_indices or last_wrapper_idx - error_indices[0] > 30:
-            start = max(0, last_wrapper_idx - 10)
-            end = min(len(lines), last_wrapper_idx + 10)
-            sections.append(('FINAL ERROR (wrapper/cascading)', lines[start:end]))
-    elif len(error_indices) > 1:
-        last_idx = error_indices[-1]
-        if last_idx - error_indices[0] > 30:
-            start = max(0, last_idx - 10)
-            end = min(len(lines), last_idx + 10)
-            sections.append(('FINAL ERROR', lines[start:end]))
-
-    # Final output (pytest summary, last 40 lines)
-    sections.append(('FINAL OUTPUT', lines[-40:]))
-
-    # Combine sections
-    result_parts = []
-    for label, section_lines in sections:
-        result_parts.append(f"--- {label} ---\n" + '\n'.join(section_lines))
-
-    result = '\n\n'.join(result_parts)
-
-    # If still too long, truncate but keep structure
-    if len(result) > max_size:
-        result = result[:max_size] + '\n... (truncated)'
-
-    return result
+    return "\n".join(lines)
 
 
-async def analyze_failure_with_claude(log_content: str) -> dict:
-    # Extract relevant sections instead of just truncating from end
-    relevant_log = _extract_relevant_log_sections(log_content)
+def _build_kf_context_text(known_failures_context: list[dict] | None) -> str:
+    """Build known failures context string for prompts."""
+    if not known_failures_context:
+        return "  (none - all failures are new)"
 
-    prompt = TRIAGE_PROMPT.format(log_content=relevant_log)
+    kf_lines = []
+    for kf in known_failures_context:
+        parts = [f"ID={kf['id']}"]
+        parts.append(kf['title'])
+        if kf.get('summary'):
+            parts.append(f"summary={kf['summary']}")
+        if kf.get('match_prompt'):
+            parts.append(f"match_when={kf['match_prompt']}")
+        parts.append(f"category={kf.get('category', 'unknown')}")
+        if kf.get('affected_jobs'):
+            parts.append(f"jobs={','.join(kf['affected_jobs'])}")
+        if kf.get('affected_tests'):
+            parts.append(f"tests={','.join(kf['affected_tests'][:5])}")
+        kf_lines.append("  " + " | ".join(parts))
+    return "\n".join(kf_lines)
 
-    # Remove CLAUDECODE env var to allow running Claude inside Claude Code sessions
+
+async def _run_claude_agentic(prompt: str, allowed_tools: str = "Read,Grep",
+                              max_turns: int = 20, timeout: int = 300) -> tuple[str | None, str | None]:
+    """Run Claude in agentic mode with tool access. Returns (result_text, session_id)."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
     proc = await asyncio.create_subprocess_exec(
         "claude",
-        "--print",
         "--output-format", "json",
         "--model", "claude-sonnet-4-5",
+        "--max-turns", str(max_turns),
+        "--allowedTools", allowed_tools,
         "-p", prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -176,217 +207,197 @@ async def analyze_failure_with_claude(log_content: str) -> dict:
     )
 
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
-        logger.error("Claude command timed out")
-        return [_fallback_analysis(relevant_log)]
+        logger.error("Claude agentic command timed out")
+        return None, None
 
     if proc.returncode != 0:
         error_msg = stderr.decode().strip() if stderr else "Unknown error"
-        logger.error(f"Claude command failed: {error_msg}")
-        return [_fallback_analysis(relevant_log)]
+        logger.error(f"Claude agentic command failed: {error_msg}")
+        return None, None
 
     try:
         response = json.loads(stdout.decode())
-        result_text = response.get("result", "")
+        session_id = response.get("session_id")
+        return response.get("result", stdout.decode()), session_id
+    except json.JSONDecodeError:
+        return stdout.decode(), None
 
-        # Try to find a JSON array first (new format)
+
+async def resume_claude_session(session_id: str, prompt: str,
+                                max_turns: int = 10, timeout: int = 120) -> str | None:
+    """Resume an existing Claude session with a follow-up prompt."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    proc = await asyncio.create_subprocess_exec(
+        "claude",
+        "--output-format", "json",
+        "--resume", session_id,
+        "--max-turns", str(max_turns),
+        "--allowedTools", "Read,Grep",
+        "-p", prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.error("Claude resume timed out")
+        return None
+
+    if proc.returncode != 0:
+        error_msg = stderr.decode().strip() if stderr else "Unknown error"
+        logger.error(f"Claude resume failed: {error_msg}")
+        return None
+
+    try:
+        response = json.loads(stdout.decode())
+        return response.get("result", stdout.decode())
+    except json.JSONDecodeError:
+        return stdout.decode()
+
+
+async def analyze_failure_with_claude(
+    log_file: str,
+    known_failures_context: list[dict] | None = None,
+    tc_executions: list[dict] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Analyze a single job's log file using Claude in agentic mode.
+
+    Args:
+        log_file: Path to the raw log file on disk.
+        known_failures_context: List of known failure dicts for matching.
+        tc_executions: Optional Test Engine failed executions for this job.
+            When provided, Claude knows exactly which tests failed and can
+            focus on finding the full execution output in the raw log.
+
+    Returns:
+        Tuple of (list of analysis dicts, session_id for resumption).
+    """
+    kf_text = _build_kf_context_text(known_failures_context)
+    tc_text = _build_tc_context_text(tc_executions)
+
+    prompt = TRIAGE_PROMPT.format(
+        known_failures_context=kf_text,
+        log_file=log_file,
+        tc_context=tc_text,
+    )
+
+    result_text, session_id = await _run_claude_agentic(prompt, max_turns=15, timeout=180)
+    if not result_text:
+        return [_fallback_analysis(log_file)], None
+
+    try:
+        # Try to find a JSON array
         array_match = re.search(r'\[[\s\S]*\]', result_text)
         if array_match:
             parsed = json.loads(array_match.group())
             if isinstance(parsed, list):
-                return parsed
+                return parsed, session_id
 
-        # Fall back to single object (old format) - wrap in array
+        # Fall back to single object - wrap in array
         json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
         if json_match:
-            return [json.loads(json_match.group())]
+            return [json.loads(json_match.group())], session_id
 
         parsed = json.loads(result_text)
         if isinstance(parsed, list):
-            return parsed
-        return [parsed]
+            return parsed, session_id
+        return [parsed], session_id
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse Claude response: {e}")
-        return [_fallback_analysis(relevant_log)]
+        return [_fallback_analysis(log_file)], session_id
 
 
-def _clean_log_line(line: str) -> str:
-    """Remove ANSI codes, buildkite timestamps, and other noise."""
-    # Remove ANSI escape codes
-    clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
-    clean = re.sub(r'\x1b_[^\x07]*\x07', '', clean)
-    # Remove buildkite timestamps like [2026-02-12T23:12:25Z]
-    clean = re.sub(r'^\s*\[[\d\-T:Z]+\]\s*', '', clean)
-    # Remove buildkite timing markers like _bk;t=1234567890
-    clean = re.sub(r'_bk;t=\d+\s*', '', clean)
-    # Remove pytest markers like [rank0]:
-    clean = re.sub(r'^\s*\[rank\d+\]:\s*', '', clean)
-    # Remove leading E markers from pytest
-    clean = re.sub(r'^\s*E\s+', '', clean)
-    return clean.strip()
+DEDUP_PROMPT = """You are deduplicating known failure records from a CI triage system.
+
+Multiple CI jobs were analyzed in parallel, and each analysis independently created
+"known failure" records. Some of these may describe the SAME underlying issue and
+should be merged.
+
+Two known failures should be merged if they describe the same root cause bug — i.e.,
+a single code fix would resolve both. Different test names or jobs are fine as long
+as the underlying error pattern is the same.
+
+Do NOT merge failures that happen to share an error type but have different root causes.
+For example, two different AssertionErrors in different modules are separate issues.
+
+KNOWN FAILURES TO EVALUATE:
+{kf_list}
+
+Return ONLY valid JSON. Format:
+{{
+  "merge_groups": [
+    {{
+      "keep_id": <int>,
+      "merge_ids": [<int>, ...],
+      "reason": "<brief explanation>"
+    }}
+  ]
+}}
+
+- Each group says: keep the KF with keep_id, merge the others (merge_ids) into it.
+- keep_id should be the lowest ID in the group.
+- If NO merges are needed (all are distinct issues), return {{"merge_groups": []}}.
+- Only group failures you are confident share the same root cause.
+"""
 
 
-def _extract_error_line(log_content: str) -> str:
-    """Extract the actual root cause error line from the log.
+async def deduplicate_known_failures(
+    kf_descriptions: list[dict],
+) -> list[dict]:
+    """Ask Claude to identify duplicate KnownFailures that should be merged.
 
-    For multiprocess systems like vLLM, we need to find the ORIGINAL error,
-    not wrapper errors like 'Server exited unexpectedly'.
+    Args:
+        kf_descriptions: List of {id, title, summary, match_prompt, category} dicts.
+
+    Returns:
+        List of merge group dicts: {keep_id, merge_ids, reason}.
+        Empty list if no merges needed.
     """
-    lines = log_content.split('\n')
+    kf_lines = []
+    for kf in kf_descriptions:
+        parts = [f"ID={kf['id']}"]
+        parts.append(f"title={kf['title']}")
+        if kf.get("summary"):
+            parts.append(f"summary={kf['summary']}")
+        if kf.get("match_prompt"):
+            parts.append(f"match_prompt={kf['match_prompt']}")
+        parts.append(f"category={kf.get('category', 'unknown')}")
+        kf_lines.append("  " + " | ".join(parts))
 
-    # Wrapper errors to SKIP - these are not informative
-    wrapper_patterns = [
-        r'Server exited unexpectedly',
-        r'Engine core initialization failed',
-        r'See root cause above',
-        r'command exited with status',
-        r'subprocess.*failed',
-        r'worker.*died',
-        r'process.*terminated',
-    ]
+    prompt = DEDUP_PROMPT.format(kf_list="\n".join(kf_lines))
 
-    # High-priority informative errors (search for these FIRST)
-    priority_patterns = [
-        (r'ValueError:?\s*Free memory on device.+', 'gpu_memory'),
-        (r'OutOfMemoryError.+', 'oom'),
-        (r'CUDA out of memory.+', 'oom'),
-        (r'AssertionError:?\s*.+accuracy.+', 'accuracy'),
-        (r'AssertionError:?\s*.+<\s*[\d.]+', 'assertion_value'),
-        (r'requests\.exceptions\.HTTPError:?\s*\d{3}.+', 'http'),
-        (r'\d{3} Client Error:.+', 'http'),
-        (r'\d{3} Server Error:.+', 'http'),
-        (r'ModuleNotFoundError:?\s*.+', 'import'),
-        (r'ImportError:?\s*.+', 'import'),
-        (r'FileNotFoundError:?\s*.+', 'file'),
-        (r'ConnectionError:?\s*.+', 'connection'),
-        (r'TimeoutError:?\s*.+', 'timeout'),
-    ]
+    # No tools needed — pure reasoning over structured data
+    result_text, _ = await _run_claude_agentic(
+        prompt, allowed_tools="", max_turns=1, timeout=60,
+    )
+    if not result_text:
+        return []
 
-    # Standard error patterns (lower priority)
-    standard_patterns = [
-        (r'AssertionError:?\s*(.+)', 'AssertionError'),
-        (r'ValueError:?\s*(.+)', 'ValueError'),
-        (r'RuntimeError:?\s*(.+)', 'RuntimeError'),
-        (r'KeyError:?\s*(.+)', 'KeyError'),
-        (r'TypeError:?\s*(.+)', 'TypeError'),
-        (r'CUDA.*error:?\s*(.+)', 'CUDAError'),
-    ]
+    try:
+        json_match = re.search(r'\{[\s\S]*"merge_groups"[\s\S]*\}', result_text)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            return parsed.get("merge_groups", [])
 
-    def is_wrapper_error(text: str) -> bool:
-        return any(re.search(p, text, re.IGNORECASE) for p in wrapper_patterns)
-
-    # First pass: look for high-priority informative errors
-    for line in lines:
-        clean_line = _clean_log_line(line)
-        if is_wrapper_error(clean_line):
-            continue
-        for pattern, _ in priority_patterns:
-            match = re.search(pattern, clean_line, re.IGNORECASE)
-            if match:
-                return match.group(0).strip()[:300]
-
-    # Second pass: look for standard errors (skip wrapper errors)
-    for line in lines:
-        clean_line = _clean_log_line(line)
-        if is_wrapper_error(clean_line):
-            continue
-        for pattern, _ in standard_patterns:
-            match = re.search(pattern, clean_line, re.IGNORECASE)
-            if match:
-                return match.group(0).strip()[:300]
-
-    # Fallback: find any line with "Error:" or "FAILED"
-    for line in reversed(lines):
-        if 'Error:' in line or 'FAILED' in line:
-            clean_line = _clean_log_line(line)
-            if clean_line and len(clean_line) > 10:
-                return clean_line[:300]
-
-    return "Error details not found in log"
+        parsed = json.loads(result_text)
+        return parsed.get("merge_groups", [])
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse dedup response: {e}")
+        return []
 
 
-def _fallback_analysis(log_content: str) -> dict:
-    log_lower = log_content.lower()
-    error_message = _extract_error_line(log_content)
-
-    if any(kw in log_lower for kw in ["docker", "pull", "image not found", "manifest"]):
-        return {
-            "category": "infra",
-            "error_signature": "infra:DockerError:image_or_container",
-            "error_message": error_message,
-            "root_cause": "Docker image or container issue",
-            "is_flaky": False,
-        }
-
-    if "httperror" in log_lower or "403" in log_lower or "502" in log_lower or "connection" in log_lower:
-        return {
-            "category": "infra",
-            "error_signature": "infra:HTTPError:network_failure",
-            "error_message": error_message,
-            "root_cause": "Network or HTTP request failure",
-            "is_flaky": True,
-        }
-
-    if any(kw in log_lower for kw in ["nccl", "cuda error", "device not found"]):
-        return {
-            "category": "infra",
-            "error_signature": "infra:GPUError:device_issue",
-            "error_message": error_message,
-            "root_cause": "GPU infrastructure issue",
-            "is_flaky": True,
-        }
-
-    if "oserror" in log_lower and ("resource temporarily unavailable" in log_lower or "errno 11" in log_lower):
-        return {
-            "category": "infra",
-            "error_signature": "infra:OSError:resource_temporarily_unavailable",
-            "error_message": error_message,
-            "root_cause": "System resource exhaustion",
-            "is_flaky": True,
-        }
-
-    if any(kw in log_lower for kw in ["timeout", "timed out"]):
-        return {
-            "category": "infra",
-            "error_signature": "infra:Timeout:process_hung",
-            "error_message": error_message,
-            "root_cause": "Possible infrastructure slowdown or hanging process",
-            "is_flaky": True,
-        }
-
-    if any(kw in log_lower for kw in ["assertionerror", "assert ", "failed assertion", "accuracy too low"]):
-        return {
-            "category": "test",
-            "error_signature": "unknown_test:AssertionError:fallback",
-            "error_message": error_message,
-            "root_cause": "Test validation failure",
-            "is_flaky": False,
-        }
-
-    if any(kw in log_lower for kw in ["importerror", "modulenotfounderror", "no module named"]):
-        return {
-            "category": "test",
-            "error_signature": "unknown_test:ImportError:missing_module",
-            "error_message": error_message,
-            "root_cause": "Missing dependency or import issue",
-            "is_flaky": False,
-        }
-
-    if "error" in log_lower or "failed" in log_lower:
-        return {
-            "category": "test",
-            "error_signature": "unknown_test:Error:fallback",
-            "error_message": error_message,
-            "root_cause": "Unable to determine root cause",
-            "is_flaky": False,
-        }
-
+def _fallback_analysis(log_file: str) -> dict:
+    """Minimal fallback when Claude analysis fails entirely."""
     return {
         "category": "test",
         "error_signature": "unknown:fallback_analysis",
-        "error_message": error_message,
+        "error_message": f"Claude analysis failed for {log_file}",
         "root_cause": "Log analysis inconclusive",
-        "is_flaky": False,
     }

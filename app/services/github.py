@@ -114,6 +114,51 @@ class GitHubService:
             except Exception as e:
                 logger.error(f"Failed to sync issue {issue.github_issue_number}: {e}")
 
+    async def list_main_commits(
+        self,
+        since: str | None = None,
+        until: str | None = None,
+        per_page: int = 100,
+    ) -> list[dict]:
+        """List commits on main branch, optionally filtered by date range.
+
+        Uses the GitHub REST API directly (no auth required for public repos).
+
+        Args:
+            since: ISO 8601 datetime string (e.g., "2026-02-18T00:00:00Z")
+            until: ISO 8601 datetime string
+            per_page: Max commits to return
+
+        Returns:
+            List of {sha, message, date} dicts, newest first.
+        """
+        import httpx
+
+        params: dict[str, str | int] = {"sha": "main", "per_page": per_page}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+
+        url = f"https://api.github.com/repos/{self.repo}/commits"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            logger.warning(f"Failed to list GitHub commits: {e}")
+            return []
+
+        commits = []
+        for item in data:
+            sha = item.get("sha", "")
+            commit = item.get("commit", {})
+            message = commit.get("message", "").split("\n")[0]
+            date = commit.get("committer", {}).get("date")
+            commits.append({"sha": sha, "message": message, "date": date})
+        return commits
+
     async def get_or_create_issue(self, issue_number: int) -> GitHubIssue:
         stmt = select(GitHubIssue).where(GitHubIssue.github_issue_number == issue_number)
         result = await self.session.execute(stmt)

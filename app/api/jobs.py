@@ -29,7 +29,7 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/{job_id}/retry")
 async def retry_job(job_id: int, db: AsyncSession = Depends(get_db)):
-    stmt = select(Job).where(Job.id == job_id)
+    stmt = select(Job).where(Job.id == job_id).options(selectinload(Job.build))
     result = await db.execute(stmt)
     job = result.scalar_one_or_none()
 
@@ -37,10 +37,11 @@ async def retry_job(job_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found")
 
     buildkite = BuildkiteService()
-    success = await buildkite.retry_job(job.buildkite_job_id)
+    success = await buildkite.retry_job(job.buildkite_job_id, job.build.buildkite_build_number)
 
     if success:
         job.retry_count += 1
+        job.retry_pending = True
         await db.commit()
         return {"message": "Job retry initiated", "retry_count": job.retry_count}
     else:

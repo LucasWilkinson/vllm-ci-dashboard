@@ -28,7 +28,9 @@ export interface FailedJobSummary {
   error_signature: string | null
   error_message: string | null
   log_excerpt: string | null
-  is_flaky: boolean
+  flaky_status: string | null
+  known_failure_id: number | null
+  known_failure_title: string | null
   linked_issue_number: number | null
   linked_issue_state: string | null
   linked_issue_url: string | null
@@ -49,22 +51,6 @@ export interface BuildWithFailures {
   failed_jobs: FailedJobSummary[]
 }
 
-export interface BuildSummary {
-  id: number
-  buildkite_build_number: number
-  build_type: string | null
-  state: string | null
-  branch: string | null
-  message: string | null
-  web_url: string | null
-  triage_status: string
-  created_at: string | null
-  total_jobs: number
-  failed_jobs: number
-  infra_failures: number
-  test_failures: number
-}
-
 export interface Failure {
   id: number
   job_id: number
@@ -74,6 +60,7 @@ export interface Failure {
   error_message: string | null
   root_cause: string | null
   is_flaky: boolean
+  retry_passed: boolean
   log_excerpt: string | null
 }
 
@@ -86,21 +73,23 @@ export interface Job {
   step_key: string | null
   web_url: string | null
   retry_count: number
-  failure: Failure | null
+  failures: Failure[]
 }
 
-export interface Build extends BuildSummary {
+export interface Build {
+  id: number
+  buildkite_build_number: number
+  build_type: string | null
+  state: string | null
   commit_sha: string | null
+  branch: string | null
+  message: string | null
+  web_url: string | null
+  triage_status: string
+  created_at: string | null
+  total_jobs: number
   synced_at: string
   jobs: Job[]
-}
-
-export interface DashboardSummary {
-  total_builds: number
-  pending_triages: number
-  completed_triages: number
-  infra_failures_today: number
-  test_failures_today: number
 }
 
 export interface FailureSuggestion {
@@ -112,54 +101,109 @@ export interface FailureSuggestion {
   match_reason: string
 }
 
-export interface FailingBuildInfo {
-  build_number: number
-  commit_sha: string | null
-  build_url: string | null
-  job_url: string | null
-}
-
-export interface CurrentIssue {
-  failure_id: number
-  job_id: number
-  job_name: string
-  job_url: string | null
-  failing_test: string | string[] | null
-  failure_type: string | null
-  error_message: string | null
-  error_signature: string | null
-  log_excerpt: string | null
-  first_seen_build: number
-  last_seen_build: number
-  occurrence_count: number
-  is_flaky: boolean
-  flaky_rate: number | null
-  retry_success_count: number | null
-  signature_occurrence_count: number | null
-  linked_issue_number: number | null
-  linked_issue_url: string | null
-  resolved_by_pr: number | null
-  failing_builds: FailingBuildInfo[]
-}
-
-export interface CurrentIssueGroup {
-  error_key: string
-  error_message: string | null
-  failure_type: string | null
-  linked_issue_number: number | null
-  linked_issue_url: string | null
-  total_affected_tests: number
-  first_seen_build: number
-  last_seen_build: number
-  issues: CurrentIssue[]
-}
-
 export interface GitHubIssue {
   id: number
   github_issue_number: number
   title: string | null
   state: string | null
   github_issue_url: string | null
+}
+
+// KnownFailure interfaces
+export interface KnownFailureInstance {
+  failure_id: number
+  job_id: number
+  job_name: string
+  job_url: string | null
+  failing_test: string | string[] | null
+  error_message: string | null
+  log_excerpt: string | null
+}
+
+export interface FailuresByBuild {
+  build_number: number
+  build_url: string | null
+  commit_sha: string | null
+  created_at: string | null
+  commits_behind: number
+  failures: KnownFailureInstance[]
+}
+
+export interface BuildRef {
+  build_number: number
+  commit_sha: string | null
+  created_at: string | null
+  message: string | null
+}
+
+export interface KnownFailure {
+  id: number
+  title: string
+  summary: string | null
+  match_prompt: string | null
+  category: string | null
+  status: string
+  is_flaky: boolean
+  github_issue: GitHubIssue | null
+  resolved_by_pr: number | null
+  resolved_by: string | null
+  resolved_in_build: BuildRef | null
+  first_seen_build: BuildRef | null
+  last_seen_build: BuildRef | null
+  failure_count: number
+  affected_jobs: string[]
+  failures_by_build?: FailuresByBuild[]
+}
+
+export type HistoryStatus = 'not_run' | 'job_fail' | 'infra_fail' | 'other_fail' | 'diff_fail' | 'fail' | 'pass' | 'flaky_pass'
+
+export interface BuildInHistory {
+  build_number: number
+  build_url: string | null
+  build_type: string | null
+  status: HistoryStatus
+}
+
+export interface BuildHistoryEntry {
+  commit_sha: string | null
+  created_at: string | null
+  message: string | null
+  status: HistoryStatus  // Aggregate worst status across builds for this commit
+  triaged: boolean  // False for commits with no DB builds (filled from GitHub)
+  builds: BuildInHistory[]
+  failures: KnownFailureInstance[]
+}
+
+export interface KnownFailureHistory {
+  known_failure_id: number
+  title: string
+  affected_jobs: string[]
+  affected_tests: string[]
+  predates_history: boolean
+  no_prior_runs: boolean
+  is_flaky: boolean
+  entries: BuildHistoryEntry[]
+}
+
+export interface BuildInTimeline {
+  build_number: number
+  build_type: string | null
+  state: string | null
+  web_url: string | null
+  triage_status: string
+  total_jobs: number
+  failed_job_count: number
+  passed_job_count: number
+  not_run_job_count: number
+}
+
+export interface CommitTimelineEntry {
+  commit_sha: string | null
+  message: string | null
+  created_at: string | null
+  status: string  // worst aggregate state across builds
+  builds: BuildInTimeline[]
+  failed_jobs: FailedJobSummary[]
 }
 
 function cleanParams(params?: Record<string, string | undefined>): Record<string, string> {
@@ -169,10 +213,14 @@ function cleanParams(params?: Record<string, string | undefined>): Record<string
   ) as Record<string, string>
 }
 
+export interface HealthCheck {
+  status: 'healthy' | 'degraded'
+  checks: Record<string, string>
+}
+
 export const api = {
+  health: () => fetchApi<HealthCheck>('/health'),
   builds: {
-    list: (params?: { build_type?: string; triage_status?: string; state?: string; branch?: string; nightly_daily?: string }) =>
-      fetchApi<BuildWithFailures[]>(`/builds?${new URLSearchParams(cleanParams(params))}`),
     get: (buildNumber: number) =>
       fetchApi<Build>(`/builds/${buildNumber}`),
     sync: (limit?: number) =>
@@ -180,52 +228,23 @@ export const api = {
         `/builds/sync?limit=${limit || 20}`,
         { method: 'POST' }
       ),
-    syncBuild: (buildNumber: number) =>
-      fetchApi<{ synced: boolean; triaged: boolean; message: string }>(
-        `/builds/${buildNumber}/sync`,
-        { method: 'POST' }
-      ),
-    dashboardSummary: () =>
-      fetchApi<DashboardSummary>('/builds/dashboard/summary'),
-    currentIssues: () =>
-      fetchApi<CurrentIssue[]>('/builds/current-issues'),
-    currentIssuesGrouped: () =>
-      fetchApi<CurrentIssueGroup[]>('/builds/current-issues-grouped'),
+    timeline: (params?: { branch?: string; nightly_daily?: string }) =>
+      fetchApi<CommitTimelineEntry[]>(`/builds/timeline?${new URLSearchParams(cleanParams(params))}`),
   },
   triages: {
-    getFailure: (failureId: number) =>
-      fetchApi<Failure>(`/triages/failures/${failureId}`),
     getSuggestions: (failureId: number) =>
       fetchApi<FailureSuggestion[]>(`/triages/failures/${failureId}/suggestions`),
-    retriage: (failureId: number) =>
-      fetchApi<Failure>(`/triages/failures/${failureId}/retriage`, { method: 'POST' }),
     updateFailure: (failureId: number, update: { failure_category?: string; failure_type?: string; is_flaky?: boolean }) =>
       fetchApi<Failure>(`/triages/failures/${failureId}`, {
         method: 'PATCH',
         body: JSON.stringify(update),
       }),
-    markResolvedByPR: (failureId: number, prNumber: number) =>
-      fetchApi<{ message: string; failure_id: number; resolved_by_pr: number }>(
-        `/triages/failures/${failureId}/resolved-by-pr`,
-        { method: 'POST', body: JSON.stringify({ pr_number: prNumber }) }
-      ),
-    unmarkResolvedByPR: (failureId: number) =>
-      fetchApi<{ message: string; failure_id: number }>(
-        `/triages/failures/${failureId}/resolved-by-pr`,
-        { method: 'DELETE' }
-      ),
   },
   jobs: {
-    get: (jobId: number) =>
-      fetchApi<Job>(`/jobs/${jobId}`),
     retry: (jobId: number) =>
       fetchApi<{ message: string; retry_count: number }>(`/jobs/${jobId}/retry`, { method: 'POST' }),
-    getLog: (jobId: number) =>
-      fetchApi<{ job_id: number; log: string }>(`/jobs/${jobId}/log`),
   },
   issues: {
-    list: (state?: string) =>
-      fetchApi<GitHubIssue[]>(`/issues?${state ? `state=${state}` : ''}`),
     createForFailure: (failureId: number, data: { title: string; body: string; labels?: string[] }) =>
       fetchApi<GitHubIssue>(`/issues/failures/${failureId}/create`, {
         method: 'POST',
@@ -240,5 +259,59 @@ export const api = {
       fetchApi<{ message: string }>(`/issues/failures/${failureId}/unlink/${issueNumber}`, {
         method: 'DELETE',
       }),
+  },
+  knownFailures: {
+    list: (params?: { status?: string; category?: string; resolved_since_hours?: number; is_flaky?: boolean }) => {
+      const searchParams = new URLSearchParams(cleanParams({
+        status: params?.status ?? 'open',
+        category: params?.category,
+        resolved_since_hours: params?.resolved_since_hours?.toString(),
+        is_flaky: params?.is_flaky !== undefined ? String(params.is_flaky) : undefined,
+      }))
+      return fetchApi<KnownFailure[]>(`/known-failures?${searchParams}`)
+    },
+    get: (id: number) =>
+      fetchApi<KnownFailure>(`/known-failures/${id}`),
+    getHistory: (id: number) =>
+      fetchApi<KnownFailureHistory>(`/known-failures/${id}/history`),
+    update: (id: number, update: { title?: string; summary?: string; match_prompt?: string; category?: string; is_flaky?: boolean }) =>
+      fetchApi<KnownFailure>(`/known-failures/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(update),
+      }),
+    resolve: (id: number, resolvedByPr?: number) =>
+      fetchApi<{ message: string; id: number }>(`/known-failures/${id}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ resolved_by_pr: resolvedByPr }),
+      }),
+    reopen: (id: number) =>
+      fetchApi<{ message: string; id: number }>(`/known-failures/${id}/reopen`, { method: 'POST' }),
+    linkIssue: (id: number, issueNumber: number) =>
+      fetchApi<{ message: string; id: number }>(`/known-failures/${id}/link-issue`, {
+        method: 'POST',
+        body: JSON.stringify({ github_issue_number: issueNumber }),
+      }),
+    unlinkIssue: (id: number) =>
+      fetchApi<{ message: string; id: number }>(`/known-failures/${id}/unlink-issue`, { method: 'DELETE' }),
+    merge: (sourceId: number, targetId: number) =>
+      fetchApi<{ message: string; target_id: number }>('/known-failures/merge', {
+        method: 'POST',
+        body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+      }),
+    split: (failureIds: number[], newTitle: string) =>
+      fetchApi<{ message: string; new_id: number }>('/known-failures/split', {
+        method: 'POST',
+        body: JSON.stringify({ failure_ids: failureIds, new_title: newTitle }),
+      }),
+    loadEarlierHistory: (id: number) =>
+      fetchApi<{ message: string; builds_found: number }>(`/known-failures/${id}/load-earlier-history`, {
+        method: 'POST',
+      }),
+    triageCommit: (id: number, commitSha: string) =>
+      fetchApi<{ message: string }>(`/known-failures/${id}/triage-commit?commit_sha=${encodeURIComponent(commitSha)}`, {
+        method: 'POST',
+      }),
+    getActiveTriages: (id: number) =>
+      fetchApi<{ commits: string[]; statuses: Record<string, string> }>(`/known-failures/${id}/active-triages`),
   },
 }
