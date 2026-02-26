@@ -151,11 +151,18 @@ function HistoryEntry({ entry, onTriageCommit, triageState }: {
               Triage
             </button>
           )}
-          {entry.created_at && (
-            <span className="text-gray-600 text-xs">
-              {timeAgo(entry.created_at)}
-            </span>
-          )}
+          <div className="flex flex-col items-end">
+            {entry.committed_at && (
+              <span className="text-gray-500 text-xs">
+                {timeAgo(entry.committed_at)}
+              </span>
+            )}
+            {entry.created_at && (
+              <span className="text-gray-600 text-xs">
+                triaged {timeAgo(entry.created_at)}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -294,8 +301,11 @@ function FailureBuildGroup({
             {group.commit_sha.slice(0, 8)}
           </a>
         )}
+        {group.committed_at && (
+          <span className="text-gray-500">{timeAgo(group.committed_at)}</span>
+        )}
         {group.created_at && (
-          <span className="text-gray-500">{timeAgo(group.created_at)}</span>
+          <span className="text-gray-600">triaged {timeAgo(group.created_at)}</span>
         )}
       </div>
       {group.failures.map((instance) => (
@@ -921,7 +931,7 @@ export default function KnownFailureDetail() {
                 href={kf.github_issue.github_issue_url || '#'}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="px-2 py-0.5 rounded text-xs bg-github-green text-white"
+                className={`px-2 py-0.5 rounded text-xs text-white ${kf.github_issue?.state === 'closed' ? 'bg-github-purple' : 'bg-github-green'}`}
               >
                 #{kf.github_issue.github_issue_number}
               </a>

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db, get_db_session
-from app.models import Build, Job, Failure, KnownFailure
+from app.models import Build, Job, Failure, KnownFailure, KnownFailureEvent, log_kf_event
 from app.schemas.known_failure import (
     KnownFailureResponse,
     KnownFailureUpdate,
@@ -48,15 +48,38 @@ def _parse_failing_test(value: str | None) -> str | list[str] | None:
 
 
 async def _build_known_failure_response(
-    kf: KnownFailure, db: AsyncSession, include_failures_by_build: bool = False
+    kf: KnownFailure, db: AsyncSession, include_failures_by_build: bool = False,
+    commit_dates_cache: dict[str, datetime] | None = None,
 ) -> KnownFailureResponse:
-    """Build a KnownFailureResponse from a KnownFailure model instance."""
+    """Build a KnownFailureResponse from a KnownFailure model instance.
+
+    Args:
+        commit_dates_cache: Pre-fetched commit dates to avoid per-KF GitHub API calls.
+            If None, dates are fetched on demand.
+    """
+    ref_commit_dates: dict[str, datetime] = commit_dates_cache or {}
+    if commit_dates_cache is None:
+        # Fetch on demand (single KF detail view)
+        ref_builds = [b for b in [kf.first_seen_build, kf.last_seen_build, kf.resolved_in_build] if b]
+        ref_shas = {b.commit_sha for b in ref_builds if b.commit_sha}
+        if ref_shas:
+            try:
+                gh = GitHubService(db)
+                date_strs = await gh.get_commit_dates(ref_shas)
+                for sha, date_str in date_strs.items():
+                    ref_commit_dates[sha] = datetime.fromisoformat(
+                        date_str.replace("Z", "+00:00")
+                    )
+            except Exception:
+                pass
+
     # Get first/last seen build refs
     first_seen = None
     if kf.first_seen_build:
         first_seen = BuildRef(
             build_number=kf.first_seen_build.buildkite_build_number,
             commit_sha=kf.first_seen_build.commit_sha,
+            committed_at=ref_commit_dates.get(kf.first_seen_build.commit_sha or ""),
             created_at=kf.first_seen_build.created_at,
             message=kf.first_seen_build.message,
         )
@@ -66,6 +89,7 @@ async def _build_known_failure_response(
         last_seen = BuildRef(
             build_number=kf.last_seen_build.buildkite_build_number,
             commit_sha=kf.last_seen_build.commit_sha,
+            committed_at=ref_commit_dates.get(kf.last_seen_build.commit_sha or ""),
             created_at=kf.last_seen_build.created_at,
             message=kf.last_seen_build.message,
         )
@@ -75,6 +99,7 @@ async def _build_known_failure_response(
         resolved_in_build = BuildRef(
             build_number=kf.resolved_in_build.buildkite_build_number,
             commit_sha=kf.resolved_in_build.commit_sha,
+            committed_at=ref_commit_dates.get(kf.resolved_in_build.commit_sha or ""),
             created_at=kf.resolved_in_build.created_at,
             message=kf.resolved_in_build.message,
         )
@@ -103,6 +128,25 @@ async def _build_known_failure_response(
             if build_id not in build_groups:
                 build_groups[build_id] = []
             build_groups[build_id].append(f)
+
+        # Fetch GitHub commit dates for all commit SHAs
+        commit_shas = set()
+        for failures in build_groups.values():
+            build = failures[0].job.build
+            if build.commit_sha:
+                commit_shas.add(build.commit_sha)
+
+        gh_commit_dates: dict[str, datetime] = {}
+        if commit_shas:
+            gh = GitHubService(db)
+            try:
+                date_strs = await gh.get_commit_dates(commit_shas)
+                for sha, date_str in date_strs.items():
+                    gh_commit_dates[sha] = datetime.fromisoformat(
+                        date_str.replace("Z", "+00:00")
+                    )
+            except Exception:
+                pass  # GitHub fetch is best-effort
 
         for build_id, failures in build_groups.items():
             build = failures[0].job.build
@@ -133,6 +177,7 @@ async def _build_known_failure_response(
                 build_number=build.buildkite_build_number,
                 build_url=build.web_url,
                 commit_sha=build.commit_sha,
+                committed_at=gh_commit_dates.get(build.commit_sha or ""),
                 created_at=build.created_at,
                 commits_behind=build_commits_behind,
                 failures=instances,
@@ -203,8 +248,27 @@ async def list_known_failures(
     result = await db.execute(stmt)
     known_failures = result.scalars().all()
 
+    # Batch-fetch all commit dates upfront (one GitHub API call per unique SHA)
+    all_shas: set[str] = set()
+    for kf in known_failures:
+        for b in [kf.first_seen_build, kf.last_seen_build, kf.resolved_in_build]:
+            if b and b.commit_sha:
+                all_shas.add(b.commit_sha)
+
+    commit_dates_cache: dict[str, datetime] = {}
+    if all_shas:
+        try:
+            gh = GitHubService(db)
+            date_strs = await gh.get_commit_dates(all_shas)
+            for sha, date_str in date_strs.items():
+                commit_dates_cache[sha] = datetime.fromisoformat(
+                    date_str.replace("Z", "+00:00")
+                )
+        except Exception:
+            pass
+
     return [
-        await _build_known_failure_response(kf, db, include_failures_by_build=False)
+        await _build_known_failure_response(kf, db, include_failures_by_build=False, commit_dates_cache=commit_dates_cache)
         for kf in known_failures
     ]
 
@@ -467,7 +531,7 @@ async def get_known_failure_history(
             failures=all_failures,
         ))
 
-    # 6b. Fill in missing commits from GitHub
+    # 6b. Fill in missing commits from GitHub and populate committed_at
     # Our DB only has builds that were synced. Many main-branch commits may not
     # have been captured. Fetch the commit list from GitHub and insert "not_run"
     # entries for any commits we don't have.
@@ -486,14 +550,29 @@ async def get_known_failure_history(
                     until=until_dt.isoformat() + "Z" if until_dt else None,
                     per_page=100,
                 )
-                # Insert missing commits as "not_run" entries in chronological order
+                # Build SHA → date lookup for committed_at
+                gh_commit_dates: dict[str, datetime] = {}
+                for commit in gh_commits:
+                    if commit.get("date"):
+                        gh_commit_dates[commit["sha"]] = datetime.fromisoformat(
+                            commit["date"].replace("Z", "+00:00")
+                        )
+
+                # Populate committed_at on existing entries
+                for entry in entries:
+                    if entry.commit_sha and entry.commit_sha in gh_commit_dates:
+                        entry.committed_at = gh_commit_dates[entry.commit_sha]
+
+                # Insert missing commits as "not_run" entries
                 new_entries = []
                 for commit in gh_commits:
                     sha = commit["sha"]
                     if sha not in existing_shas:
+                        committed_at = gh_commit_dates.get(sha)
                         new_entries.append(BuildHistoryEntry(
                             commit_sha=sha,
-                            created_at=commit.get("date"),
+                            committed_at=committed_at,
+                            created_at=None,
                             message=commit.get("message"),
                             status="not_run",
                             triaged=False,
@@ -502,51 +581,22 @@ async def get_known_failure_history(
                         ))
                 if new_entries:
                     entries.extend(new_entries)
-                    # Re-sort newest-first by created_at
-                    # DB entries are timezone-naive, GitHub entries are timezone-aware;
-                    # strip tzinfo so they're comparable.
-                    entries.sort(
-                        key=lambda e: e.created_at.replace(tzinfo=None) if e.created_at else datetime.min,
-                        reverse=True,
-                    )
+
+                # Re-sort newest-first by committed_at (fall back to created_at)
+                # Strip tzinfo for consistent comparison
+                def _sort_key(e: BuildHistoryEntry) -> datetime:
+                    dt = e.committed_at or e.created_at
+                    if dt is None:
+                        return datetime.min
+                    if dt.tzinfo is not None:
+                        dt = dt.replace(tzinfo=None)
+                    return dt
+
+                entries.sort(key=_sort_key, reverse=True)
             except Exception as e:
                 logger.warning(f"Failed to fill GitHub commits for KF history: {e}")
 
-    # 6c. Trim history to relevant window: from the first pass before first_seen onwards.
-    #     This gives context ("was passing → stopped running → started failing")
-    #     without showing the entire build history.
-    no_prior_runs = False
-    if not predates_history and first_seen_build_number and len(entries) > 1:
-        # Find the first_seen entry position (entries are newest-first)
-        first_seen_idx = None
-        for i, entry in enumerate(entries):
-            if entry.builds:
-                for b in entry.builds:
-                    if b.build_number == first_seen_build_number:
-                        first_seen_idx = i
-                        break
-            if first_seen_idx is not None:
-                break
-
-        if first_seen_idx is not None and first_seen_idx < len(entries) - 1:
-            # Walk backwards (older entries) looking for a pass
-            found_pass = False
-            trim_idx = len(entries)  # Default: show everything
-            for i in range(first_seen_idx + 1, len(entries)):
-                if entries[i].status == "pass":
-                    trim_idx = i + 1  # Include the pass
-                    found_pass = True
-                    break
-
-            entries = entries[:trim_idx]
-
-            if not found_pass:
-                # All entries before first_seen are "not_run" — no prior test runs
-                prior_entries = entries[first_seen_idx + 1:]
-                if prior_entries and all(e.status == "not_run" for e in prior_entries):
-                    no_prior_runs = True
-
-    # 7. For resolved KFs, ensure the resolved_in_build appears in the history
+    # 6c. For resolved KFs, ensure the resolved_in_build appears in the history
     if kf.status == "resolved" and kf.resolved_in_build:
         rib = kf.resolved_in_build
         rib_sha = rib.commit_sha
@@ -577,25 +627,49 @@ async def get_known_failure_history(
             if not inserted:
                 entries.insert(0, rib_entry)
 
-    # 8. For resolved (non-flaky) KFs, trim to 3 passes after last failure
-    if kf.status == "resolved" and not kf.is_flaky:
-        last_fail_idx = None
-        for i, entry in enumerate(entries):
-            if entry.status in ("fail", "flaky_pass"):
-                last_fail_idx = i
+    # 7. Trim to failure window with one pass of context on each side.
+    #    Entries are newest-first. Find the failure window (first fail → last fail),
+    #    keep one pass above the first failure and one pass below the last failure.
+    #    Only count actual failures of THIS known failure (fail, flaky_pass) — not
+    #    other_fail/infra_fail/job_fail which are unrelated to this specific issue.
+    _FAIL_STATUSES = {"fail", "flaky_pass"}
+    no_prior_runs = False
+    first_fail_idx = None
+    last_fail_idx = None
+    for i, entry in enumerate(entries):
+        if entry.status in _FAIL_STATUSES:
+            if first_fail_idx is None:
+                first_fail_idx = i
+            last_fail_idx = i
+
+    if first_fail_idx is not None:
+        # Top trim: find the first pass above (before, i.e. newer than) the first failure.
+        # If found, clip to that pass. If not, keep everything up to the present
+        # (the failure is still active, so show all recent not_run commits).
+        top = 0
+        for i in range(first_fail_idx - 1, -1, -1):
+            if entries[i].status == "pass":
+                top = i
                 break
-        if last_fail_idx is not None:
-            passes_before_fail = 0
-            cutoff = last_fail_idx
-            for i in range(last_fail_idx - 1, -1, -1):
-                if entries[i].status == "pass":
-                    passes_before_fail += 1
-                if passes_before_fail >= 3:
-                    cutoff = i
-                    break
-            else:
-                cutoff = 0
-            entries = entries[cutoff:]
+
+        # Bottom trim: find the first pass below (after) the last failure.
+        # Keep that pass, trim everything older.
+        bottom = len(entries)
+        found_bottom_pass = False
+        for i in range(last_fail_idx + 1, len(entries)):
+            if entries[i].status == "pass":
+                bottom = i + 1  # Include the pass
+                found_bottom_pass = True
+                break
+
+        # Detect no_prior_runs: no pass found below failures, and the oldest
+        # entries are all "not_run" (test never ran before it started failing)
+        if not found_bottom_pass and not predates_history:
+            trailing = entries[last_fail_idx + 1:]
+            if trailing and all(e.status == "not_run" for e in trailing):
+                no_prior_runs = True
+
+        entries = entries[top:bottom]
 
     return KnownFailureHistory(
         known_failure_id=kf.id,
@@ -676,6 +750,10 @@ async def resolve_known_failure(
     if latest_build:
         kf.resolved_in_build_id = latest_build.id
 
+    log_kf_event(
+        db, known_failure_id, "manual_resolve",
+        resolved_by_pr=request.resolved_by_pr,
+    )
     await db.commit()
     return {"message": "Known failure resolved", "id": kf.id}
 
@@ -699,6 +777,7 @@ async def reopen_known_failure(
     kf.resolved_by = None
     kf.resolved_in_build_id = None
 
+    log_kf_event(db, known_failure_id, "manual_reopen")
     await db.commit()
     return {"message": "Known failure reopened", "id": kf.id}
 
@@ -805,6 +884,13 @@ async def reassign_failure(
         await db.flush()
         failure.known_failure_id = new_kf.id
 
+    log_kf_event(
+        db, failure.known_failure_id, "manual_reassign",
+        failure_id=request.failure_id,
+        from_kf_id=old_kf_id,
+        to_kf_id=failure.known_failure_id,
+    )
+
     # Check if old KnownFailure is now empty
     if old_kf_id:
         remaining_stmt = select(func.count(Failure.id)).where(
@@ -870,9 +956,17 @@ async def merge_known_failures(
     # Move all failures from source to target.
     # Flush immediately so the FK changes persist before deleting the source,
     # otherwise SQLAlchemy's cascade will NULL the FKs on delete.
+    moved_count = len(source.failures)
     for failure in source.failures:
         failure.known_failure_id = target.id
     await db.flush()
+
+    log_kf_event(
+        db, target.id, "manual_merge",
+        source_id=source.id,
+        source_title=source.title,
+        failures_moved=moved_count,
+    )
 
     # Update first/last seen builds
     if source.first_seen_build and target.first_seen_build:
@@ -982,6 +1076,13 @@ async def split_failures(
     # Move failures to new KF
     for f in failures:
         f.known_failure_id = new_kf.id
+
+    log_kf_event(
+        db, new_kf.id, "manual_split",
+        source_kf_id=old_kf_id,
+        failure_ids=request.failure_ids,
+        new_title=request.new_title,
+    )
 
     # Check if old KF is now empty
     if old_kf_id:
@@ -1239,3 +1340,31 @@ async def get_active_triages(known_failure_id: int):
         "commits": list(active.keys()),
         "statuses": dict(active),
     }
+
+
+@router.get("/{known_failure_id}/events")
+async def get_known_failure_events(
+    known_failure_id: int,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get audit log events for a known failure, newest first."""
+    stmt = (
+        select(KnownFailureEvent)
+        .where(KnownFailureEvent.known_failure_id == known_failure_id)
+        .order_by(KnownFailureEvent.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    events = result.scalars().all()
+
+    return [
+        {
+            "id": e.id,
+            "known_failure_id": e.known_failure_id,
+            "event_type": e.event_type,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "details": json.loads(e.details) if e.details else None,
+        }
+        for e in events
+    ]

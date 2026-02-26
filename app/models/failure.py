@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from sqlalchemy import String, Integer, Text, ForeignKey, Boolean, DateTime
@@ -82,3 +83,24 @@ class ErrorSignature(Base):
         if self.occurrence_count < 2:
             return False
         return self.retry_success_count / self.occurrence_count >= 0.3
+
+
+class KnownFailureEvent(Base):
+    """Audit log for KnownFailure lifecycle events."""
+    __tablename__ = "known_failure_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    known_failure_id: Mapped[int] = mapped_column(Integer, index=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    details: Mapped[str | None] = mapped_column(Text)  # JSON blob
+
+
+def log_kf_event(session, known_failure_id: int, event_type: str, **details):
+    """Create a KnownFailureEvent. Call before session.commit()."""
+    event = KnownFailureEvent(
+        known_failure_id=known_failure_id,
+        event_type=event_type,
+        details=json.dumps(details) if details else None,
+    )
+    session.add(event)

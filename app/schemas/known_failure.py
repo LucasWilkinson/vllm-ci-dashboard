@@ -21,7 +21,8 @@ class FailuresByBuild(BaseModel):
     build_number: int
     build_url: str | None = None
     commit_sha: str | None = None
-    created_at: datetime | None = None
+    committed_at: datetime | None = None  # git commit time
+    created_at: datetime | None = None    # build/triage time
     commits_behind: int = 0
     failures: list[KnownFailureInstance] = []
 
@@ -30,6 +31,7 @@ class BuildRef(BaseModel):
     """Lightweight build reference for KnownFailure first/last seen."""
     build_number: int
     commit_sha: str | None = None
+    committed_at: datetime | None = None  # git commit time
     created_at: datetime | None = None
     message: str | None = None
 
@@ -69,7 +71,8 @@ class BuildHistoryEntry(BaseModel):
     Groups all builds for the same commit together.
     """
     commit_sha: str | None = None
-    created_at: datetime | None = None
+    committed_at: datetime | None = None  # git commit time
+    created_at: datetime | None = None    # build/triage time (None if not triaged)
     message: str | None = None
     status: str  # Aggregate: worst status across all builds for this commit
     triaged: bool = True  # False for commits filled from GitHub with no DB builds

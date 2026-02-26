@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 
 from app.config import settings
@@ -41,6 +42,50 @@ async def sync_latest_builds():
             await db.rollback()
 
 
+async def handle_issue_closed(issue_number: int):
+    """Background task to resolve KFs linked to a closed GitHub issue."""
+    from sqlalchemy import select
+    from app.models import GitHubIssue, KnownFailure, log_kf_event
+
+    async with get_db_session() as db:
+        try:
+            stmt = select(GitHubIssue).where(
+                GitHubIssue.github_issue_number == issue_number
+            )
+            result = await db.execute(stmt)
+            issue = result.scalar_one_or_none()
+            if not issue:
+                return
+
+            issue.state = "closed"
+
+            # Resolve linked open KFs
+            kf_stmt = (
+                select(KnownFailure)
+                .where(KnownFailure.github_issue_id == issue.id)
+                .where(KnownFailure.status == "open")
+            )
+            kf_result = await db.execute(kf_stmt)
+            linked_kfs = kf_result.scalars().all()
+            for kf in linked_kfs:
+                kf.status = "resolved"
+                kf.resolved_at = datetime.utcnow()
+                kf.resolved_by = "issue_closed"
+                log_kf_event(
+                    db, kf.id, "issue_closed",
+                    github_issue_number=issue_number,
+                )
+                logger.info(
+                    f"Webhook: resolved KF#{kf.id} '{kf.title}' — "
+                    f"issue #{issue_number} closed"
+                )
+
+            await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to handle issue closed #{issue_number}: {e}")
+            await db.rollback()
+
+
 async def sync_build_from_webhook(build_number: int):
     """Background task to sync a specific build when Buildkite notifies us."""
     async with get_db_session() as db:
@@ -70,26 +115,31 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             raise HTTPException(status_code=401, detail="Invalid signature")
 
     event_type = request.headers.get("X-GitHub-Event")
-    if event_type != "push":
-        return {"status": "ignored", "event": event_type}
-
     data = json.loads(payload)
-    ref = data.get("ref", "")
 
-    if ref not in ("refs/heads/main", "refs/heads/master"):
-        return {"status": "ignored", "reason": f"not main branch: {ref}"}
+    if event_type == "issues":
+        action = data.get("action")
+        issue = data.get("issue", {})
+        issue_number = issue.get("number")
 
-    commit_sha = data.get("after", "")[:7]
-    logger.info(f"GitHub push to main: {commit_sha}")
+        if action == "closed" and issue_number:
+            logger.info(f"GitHub issue #{issue_number} closed via webhook")
+            background_tasks.add_task(handle_issue_closed, issue_number)
+            return {"status": "accepted", "event": "issues", "action": "closed", "issue": issue_number}
 
-    background_tasks.add_task(sync_latest_builds)
+        return {"status": "ignored", "event": "issues", "action": action}
 
-    return {
-        "status": "accepted",
-        "event": "push",
-        "branch": "main",
-        "commit": commit_sha,
-    }
+    if event_type == "push":
+        ref = data.get("ref", "")
+        if ref not in ("refs/heads/main", "refs/heads/master"):
+            return {"status": "ignored", "reason": f"not main branch: {ref}"}
+
+        commit_sha = data.get("after", "")[:7]
+        logger.info(f"GitHub push to main: {commit_sha}")
+        background_tasks.add_task(sync_latest_builds)
+        return {"status": "accepted", "event": "push", "branch": "main", "commit": commit_sha}
+
+    return {"status": "ignored", "event": event_type}
 
 
 @router.post("/buildkite")

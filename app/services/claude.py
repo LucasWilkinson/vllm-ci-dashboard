@@ -218,12 +218,35 @@ async def _run_claude_agentic(prompt: str, allowed_tools: str = "Read,Grep",
         logger.error(f"Claude agentic command failed: {error_msg}")
         return None, None
 
+    raw = stdout.decode()
+
+    # Handle JSONL: claude CLI may output multiple JSON lines, take the last one
+    lines = [l for l in raw.strip().splitlines() if l.strip()]
+    if len(lines) > 1:
+        raw = lines[-1]
+
     try:
-        response = json.loads(stdout.decode())
+        response = json.loads(raw)
         session_id = response.get("session_id")
-        return response.get("result", stdout.decode()), session_id
+        subtype = response.get("subtype", "")
+
+        if subtype == "error_max_turns":
+            logger.warning(f"Claude hit max turns limit (session={session_id})")
+            result = response.get("result")
+            if result:
+                return result, session_id
+            return None, session_id
+
+        result = response.get("result")
+        if result is None:
+            logger.warning(f"Claude response missing 'result' field (subtype={subtype})")
+            return None, session_id
+
+        return result, session_id
     except json.JSONDecodeError:
-        return stdout.decode(), None
+        # If we can't parse the wrapper, return the raw text (non-JSON output)
+        logger.warning(f"Claude output not valid JSON, returning raw text ({len(raw)} chars)")
+        return raw, None
 
 
 async def resume_claude_session(session_id: str, prompt: str,
@@ -255,17 +278,55 @@ async def resume_claude_session(session_id: str, prompt: str,
         logger.error(f"Claude resume failed: {error_msg}")
         return None
 
+    raw = stdout.decode()
+    lines = [l for l in raw.strip().splitlines() if l.strip()]
+    if len(lines) > 1:
+        raw = lines[-1]
+
     try:
-        response = json.loads(stdout.decode())
-        return response.get("result", stdout.decode())
+        response = json.loads(raw)
+        return response.get("result", raw)
     except json.JSONDecodeError:
-        return stdout.decode()
+        return raw
+
+
+def _parse_claude_response(result_text: str) -> list[dict] | None:
+    """Parse Claude's response text into a list of analysis dicts.
+
+    Returns None if parsing fails entirely.
+    """
+    if not result_text or not result_text.strip():
+        logger.warning("Empty Claude response text")
+        return None
+
+    try:
+        # Try to find a JSON array
+        array_match = re.search(r'\[[\s\S]*\]', result_text)
+        if array_match:
+            parsed = json.loads(array_match.group())
+            if isinstance(parsed, list):
+                return parsed
+
+        # Fall back to single object - wrap in array
+        json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
+        if json_match:
+            return [json.loads(json_match.group())]
+
+        parsed = json.loads(result_text)
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed]
+    except json.JSONDecodeError as e:
+        preview = result_text[:200].replace('\n', '\\n')
+        logger.error(f"Failed to parse Claude response: {e} | preview: {preview}")
+        return None
 
 
 async def analyze_failure_with_claude(
     log_file: str,
     known_failures_context: list[dict] | None = None,
     tc_executions: list[dict] | None = None,
+    max_retries: int = 2,
 ) -> tuple[list[dict], str | None]:
     """Analyze a single job's log file using Claude in agentic mode.
 
@@ -275,6 +336,7 @@ async def analyze_failure_with_claude(
         tc_executions: Optional Test Engine failed executions for this job.
             When provided, Claude knows exactly which tests failed and can
             focus on finding the full execution output in the raw log.
+        max_retries: Number of retry attempts after initial failure (default 2).
 
     Returns:
         Tuple of (list of analysis dicts, session_id for resumption).
@@ -288,30 +350,42 @@ async def analyze_failure_with_claude(
         tc_context=tc_text,
     )
 
-    result_text, session_id = await _run_claude_agentic(prompt, max_turns=15, timeout=180)
-    if not result_text:
-        return [_fallback_analysis(log_file)], None
+    last_session_id = None
 
-    try:
-        # Try to find a JSON array
-        array_match = re.search(r'\[[\s\S]*\]', result_text)
-        if array_match:
-            parsed = json.loads(array_match.group())
-            if isinstance(parsed, list):
-                return parsed, session_id
+    for attempt in range(1 + max_retries):
+        if attempt > 0:
+            delay = 5 * attempt  # 5s, 10s backoff
+            logger.info(f"Retrying Claude analysis for {log_file} (attempt {attempt + 1}/{1 + max_retries}, waiting {delay}s)")
+            await asyncio.sleep(delay)
 
-        # Fall back to single object - wrap in array
-        json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
-        if json_match:
-            return [json.loads(json_match.group())], session_id
+        result_text, session_id = await _run_claude_agentic(prompt, max_turns=25, timeout=300)
+        if session_id:
+            last_session_id = session_id
 
-        parsed = json.loads(result_text)
-        if isinstance(parsed, list):
-            return parsed, session_id
-        return [parsed], session_id
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse Claude response: {e}")
-        return [_fallback_analysis(log_file)], session_id
+        if not result_text:
+            logger.warning(f"Claude returned no result for {log_file} (attempt {attempt + 1}/{1 + max_retries})")
+            continue
+
+        parsed = _parse_claude_response(result_text)
+        if parsed is not None:
+            return parsed, last_session_id
+
+        # JSON parse failed — if we have a session, try resuming with a simpler prompt
+        if session_id:
+            logger.info(f"Attempting to recover via session resume after parse failure (attempt {attempt + 1})")
+            retry_text = await resume_claude_session(
+                session_id,
+                "Your previous response was not valid JSON. Return ONLY a valid JSON array of failure objects, no markdown or explanation.",
+                max_turns=3,
+                timeout=60,
+            )
+            if retry_text:
+                parsed = _parse_claude_response(retry_text)
+                if parsed is not None:
+                    return parsed, session_id
+
+    logger.error(f"Claude analysis failed after {1 + max_retries} attempts for {log_file}")
+    return [_fallback_analysis(log_file)], last_session_id
 
 
 DEDUP_PROMPT = """You are deduplicating known failure records from a CI triage system.

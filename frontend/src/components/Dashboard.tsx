@@ -111,8 +111,8 @@ function BuildRefDisplay({ label, buildRef }: { label: string; buildRef: BuildRe
           </a>
         </>
       )}
-      {buildRef.created_at && (
-        <span className="text-gray-600"> ({timeAgo(buildRef.created_at)})</span>
+      {(buildRef.committed_at || buildRef.created_at) && (
+        <span className="text-gray-600"> ({timeAgo(buildRef.committed_at || buildRef.created_at)})</span>
       )}
     </span>
   )
@@ -181,7 +181,7 @@ function KnownFailureRow({ kf }: { kf: KnownFailure }) {
       {/* Issue badge */}
       <div className="flex items-center gap-2 flex-shrink-0">
         {kf.github_issue ? (
-          <span className="px-2 py-0.5 rounded text-xs bg-github-green text-white">
+          <span className={`px-2 py-0.5 rounded text-xs text-white ${kf.github_issue.state === 'closed' ? 'bg-github-purple' : 'bg-github-green'}`}>
             #{kf.github_issue.github_issue_number}
           </span>
         ) : kf.resolved_by_pr ? (
@@ -295,7 +295,10 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
   const passedCount = entry.builds.reduce((sum, b) => sum + b.passed_job_count, 0)
   const notRunCount = entry.builds.reduce((sum, b) => sum + b.not_run_job_count, 0)
 
+  const isNotTriaged = entry.status === 'not_triaged'
+
   const getStatusDotColor = () => {
+    if (isNotTriaged) return 'bg-gray-600'
     if (entry.status === 'running' || entry.status === 'scheduled') return 'bg-blue-400'
     if (entry.status === 'passed') return 'bg-green-400'
     if (entry.status === 'failed') return 'bg-red-400'
@@ -374,23 +377,34 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
 
           {/* Right side: job counts + time */}
           <div className="flex items-center gap-3 flex-shrink-0">
-            <div className="flex items-center gap-2 text-xs">
-              {passedCount > 0 && (
-                <span className="text-green-400">{passedCount} pass</span>
-              )}
-              {testFailures.length > 0 && (
-                <span className="text-red-400">{testFailures.length} fails</span>
-              )}
-              {infraCount > 0 && (
-                <span className="text-yellow-400">{infraCount} infra</span>
-              )}
-              {notRunCount > 0 && (
-                <span className="text-gray-500">{notRunCount} not run</span>
+            {isNotTriaged ? (
+              <span className="text-gray-600 text-xs">not triaged</span>
+            ) : (
+              <div className="flex items-center gap-2 text-xs">
+                {passedCount > 0 && (
+                  <span className="text-green-400">{passedCount} pass</span>
+                )}
+                {testFailures.length > 0 && (
+                  <span className="text-red-400">{testFailures.length} fails</span>
+                )}
+                {infraCount > 0 && (
+                  <span className="text-yellow-400">{infraCount} infra</span>
+                )}
+                {notRunCount > 0 && (
+                  <span className="text-gray-500">{notRunCount} not run</span>
+                )}
+              </div>
+            )}
+            <div className="flex flex-col items-end flex-shrink-0">
+              <span className="text-gray-500 text-xs whitespace-nowrap">
+                {timeAgo(entry.committed_at)}
+              </span>
+              {entry.created_at && (
+                <span className="text-gray-600 text-xs whitespace-nowrap">
+                  triaged {timeAgo(entry.created_at)}
+                </span>
               )}
             </div>
-            <span className="text-gray-600 text-xs whitespace-nowrap">
-              {timeAgo(entry.created_at)}
-            </span>
           </div>
         </div>
       </div>
@@ -412,26 +426,42 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
               return Number(a) - Number(b)
             })
 
+            // Get Buildkite job URL from the first failure in this job group
+            const jobUrl = failures[0]?.job_url
+
             return (
               <div key={jobName} className="border-b border-gray-700 last:border-b-0">
                 <div className="px-4 py-1.5 pl-8 text-xs font-mono text-gray-400 bg-gray-800/50">
-                  {jobName}
+                  {jobUrl ? (
+                    <a
+                      href={jobUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-gray-400 hover:text-blue-400 hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {jobName} ↗
+                    </a>
+                  ) : (
+                    jobName
+                  )}
                 </div>
                 {kfEntries.map(([key, kfFailures]) => {
                   const kfId = key !== 'unassigned' ? Number(key) : null
                   const kfTitle = kfId ? kfFailures[0].known_failure_title : null
 
-                  // Collect all failing tests from all failures in this KF group
-                  const allTests: string[] = []
+                  // Collect unique failing tests from all failures in this KF group
+                  const testSet = new Set<string>()
                   for (const f of kfFailures) {
                     if (f.failing_test) {
                       if (Array.isArray(f.failing_test)) {
-                        allTests.push(...f.failing_test)
+                        f.failing_test.forEach(t => testSet.add(t))
                       } else {
-                        allTests.push(f.failing_test)
+                        testSet.add(f.failing_test)
                       }
                     }
                   }
+                  const allTests = Array.from(testSet)
 
                   const header = (
                     <div className="flex items-center gap-2 py-1.5 px-4 pl-12">
@@ -482,13 +512,14 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
                       {header}
                       <div className="pl-16 pb-1.5 space-y-1">
                         {Object.entries(byError).map(([errMsg, errFailures]) => {
-                          const allErrTests: string[] = []
+                          const errTestSet = new Set<string>()
                           for (const f of errFailures) {
                             if (f.failing_test) {
-                              if (Array.isArray(f.failing_test)) allErrTests.push(...f.failing_test)
-                              else allErrTests.push(f.failing_test)
+                              if (Array.isArray(f.failing_test)) f.failing_test.forEach(t => errTestSet.add(t))
+                              else errTestSet.add(f.failing_test)
                             }
                           }
+                          const allErrTests = Array.from(errTestSet)
                           return (
                             <div key={errMsg}>
                               <div className="text-xs text-yellow-600 leading-5 truncate">
@@ -556,9 +587,26 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
                   }
                 }
 
+                // Get the Buildkite job URL from the first failure in this job group
+                const jobUrl = jobInfraFailures[0]?.job_url
+
                 return (
                   <div key={jobName} className="px-4 pl-12 py-1.5 border-t border-gray-700/50">
-                    <div className="text-xs font-mono text-gray-400">{jobName}</div>
+                    <div className="text-xs font-mono text-gray-400">
+                      {jobUrl ? (
+                        <a
+                          href={jobUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-gray-400 hover:text-blue-400 hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {jobName} ↗
+                        </a>
+                      ) : (
+                        jobName
+                      )}
+                    </div>
                     {uniqueErrors.map((err, i) => (
                       <div key={i} className="mt-0.5">
                         <div className="text-xs text-yellow-600 truncate">
@@ -586,21 +634,24 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
 
 export default function Dashboard() {
   const queryClient = useQueryClient()
-  const [activeTab, setActiveTab] = useState<'all' | 'main' | 'nightly_daily'>('nightly_daily')
+  const [activeTab, setActiveTab] = useState<'main' | 'nightly_daily'>('main')
 
   const { data: knownFailures } = useQuery<KnownFailure[]>({
     queryKey: ['known-failures'],
     queryFn: () => api.knownFailures.list({ status: 'open', category: 'test', is_flaky: false }),
+    staleTime: 30_000,
   })
 
   const { data: flakyFailures } = useQuery<KnownFailure[]>({
     queryKey: ['known-failures-flaky'],
     queryFn: () => api.knownFailures.list({ status: 'open', category: 'all', is_flaky: true }),
+    staleTime: 30_000,
   })
 
   const { data: resolvedFailures } = useQuery<KnownFailure[]>({
     queryKey: ['known-failures-resolved'],
     queryFn: () => api.knownFailures.list({ status: 'resolved', category: 'all', resolved_since_hours: 48 }),
+    staleTime: 30_000,
   })
 
   const { data: timeline, isLoading } = useQuery<CommitTimelineEntry[]>({
@@ -608,11 +659,10 @@ export default function Dashboard() {
     queryFn: () => {
       if (activeTab === 'nightly_daily') {
         return api.builds.timeline({ nightly_daily: 'true' })
-      } else if (activeTab === 'main') {
-        return api.builds.timeline({ branch: 'main' })
       }
       return api.builds.timeline({})
     },
+    staleTime: 30_000,
   })
 
   const invalidateAll = () => {
@@ -649,16 +699,6 @@ export default function Dashboard() {
 
       {/* Tabs */}
       <div className="flex space-x-1 bg-gray-800 p-1 rounded-lg w-fit">
-        <button
-          onClick={() => setActiveTab('all')}
-          className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
-            activeTab === 'all'
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-400 hover:text-white hover:bg-gray-700'
-          }`}
-        >
-          All
-        </button>
         <button
           onClick={() => setActiveTab('main')}
           className={`px-4 py-2 rounded text-sm font-medium transition-colors ${

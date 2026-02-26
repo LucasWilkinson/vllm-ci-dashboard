@@ -5,11 +5,11 @@ import os
 import re
 from datetime import datetime
 
-from sqlalchemy import select, distinct, func, or_
+from sqlalchemy import select, distinct, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Build, Job, Failure, KnownFailure
+from app.models import Build, Job, Failure, KnownFailure, log_kf_event
 from app.services.buildkite import BuildkiteService, TestEngineService
 from app.services.claude import (
     analyze_failure_with_claude,
@@ -181,11 +181,30 @@ class TriageService:
         processes sequentially (sync+triage if failed/failing, sync-only otherwise).
         Commits after each build.
 
+        Also re-syncs any builds still in running/scheduled state in the DB.
+
         Returns dict with synced/triaged counts.
         """
         builds_data = await self.buildkite.list_recent_builds(
             limit=limit, branch=branch, nightly_daily_only=nightly_daily_only
         )
+
+        # Also re-sync builds stuck in running/scheduled state
+        stmt = select(Build.buildkite_build_number).where(
+            Build.state.in_(["running", "scheduled"])
+        )
+        result = await self.session.execute(stmt)
+        stuck_numbers = {row[0] for row in result.all()}
+        fetched_numbers = {b["number"] for b in builds_data}
+        missing = stuck_numbers - fetched_numbers
+        for build_num in missing:
+            try:
+                build_data = await self.buildkite.get_build(build_num)
+                if build_data:
+                    builds_data.append(build_data)
+            except Exception as e:
+                logger.warning(f"Failed to re-fetch stuck build #{build_num}: {e}")
+
         # Sort oldest-first so KnownFailures are created before later builds auto-resolve them
         builds_data.sort(key=lambda b: b.get("number", 0))
 
@@ -342,6 +361,11 @@ class TriageService:
                 kf.resolved_by = "auto"
                 kf.resolved_in_build_id = build.id
                 resolved_count += 1
+                log_kf_event(
+                    self.session, kf.id, "auto_resolve",
+                    build_number=build.buildkite_build_number,
+                    affected_jobs=sorted(present_affected),
+                )
 
         if resolved_count > 0:
             await self.session.flush()
@@ -437,7 +461,11 @@ class TriageService:
         # Build list of (job, log_content, tc_executions) tuples
         import tempfile
         import shutil
-        log_tmp_dir = tempfile.mkdtemp(prefix=f"triage-{build_num}-")
+        # Write temp files inside the project so Claude CLI can read them
+        # (Claude CLI restricts file access to its working directory tree)
+        project_tmp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "tmp")
+        os.makedirs(project_tmp, exist_ok=True)
+        log_tmp_dir = tempfile.mkdtemp(prefix=f"triage-{build_num}-", dir=project_tmp)
 
         job_infos: list[tuple[Job, str, list[dict] | None]] = []
         tc_only_jobs: list[tuple[Job, list[dict]]] = []  # fallback: TC data but no log
@@ -569,11 +597,20 @@ class TriageService:
                     # test function (ignoring params) or same error message
                     self._assign_sibling_parameterized_failures(job_failures)
                     self._assign_same_error_failures(job_failures)
+                    await self.session.flush()
 
                     # Retry remaining unassigned via session resume
                     unassigned = [f for f in job_failures if f.known_failure_id is None]
                     if unassigned and session_id:
                         await self._retry_unassigned_failures(unassigned, session_id, build)
+                        await self.session.flush()
+
+                    # Safety net: auto-create KFs for any still-unassigned failures
+                    still_unassigned = [f for f in job_failures if f.known_failure_id is None]
+                    if still_unassigned:
+                        await self._auto_create_kfs_for_unassigned(
+                            still_unassigned, build, job_name,
+                        )
                         await self.session.flush()
 
                     # If Claude found nothing, check for infrastructure exit patterns
@@ -620,6 +657,24 @@ class TriageService:
         await self._dedup_parallel_known_failures(created_failures, build_num)
         await self.session.flush()
 
+        # --- Cross-job auto-assignment pass ---
+        # Within-job auto-assignment may miss failures when a KF is newly created:
+        # Claude assigns 1 of N identical failures to a new KF, and the auto-assign
+        # functions catch the rest within that job. But across jobs, parallel Claude
+        # calls may each create unassigned failures for the same root cause. This pass
+        # runs across ALL failures in the build to catch stragglers.
+        self._assign_same_error_failures(created_failures)
+        self._assign_sibling_parameterized_failures(created_failures)
+        await self.session.flush()
+
+        # Safety net: auto-create KFs for any still-unassigned failures across the build
+        cross_job_unassigned = [f for f in created_failures if f.known_failure_id is None]
+        if cross_job_unassigned:
+            await self._auto_create_kfs_for_unassigned(
+                cross_job_unassigned, build, f"build #{build_num}",
+            )
+            await self.session.flush()
+
         # Summary
         total = len(created_failures)
         assigned = sum(1 for f in created_failures if f.known_failure_id is not None)
@@ -641,38 +696,14 @@ class TriageService:
     async def _load_kf_context(self, build: Build) -> tuple[list[dict], dict[int, KnownFailure]]:
         """Load KnownFailures relevant to this build for context.
 
-        Includes:
-        - All open KnownFailures
-        - Resolved KFs whose resolved_in_build is after this build
-        - KFs that predate history (first_seen is the oldest build in DB, meaning
-          the failure may have started even earlier and should be matched)
+        Only includes open KnownFailures. Resolved KFs are excluded — once a
+        failure is fixed, Claude should not match new occurrences to it.
 
         Returns (kf_context list for Claude, kf_by_id lookup dict).
         """
-        # Find the oldest build in the DB to detect predates-history KFs
-        oldest_stmt = select(func.min(Build.buildkite_build_number)).where(Build.branch == "main")
-        oldest_result = await self.session.execute(oldest_stmt)
-        oldest_build_number = oldest_result.scalar()
-
         kf_stmt = (
             select(KnownFailure)
-            .where(
-                or_(
-                    KnownFailure.status == "open",
-                    # Include resolved KFs that were resolved after this build
-                    KnownFailure.resolved_in_build_id.in_(
-                        select(Build.id).where(
-                            Build.buildkite_build_number > build.buildkite_build_number
-                        )
-                    ),
-                    # Include predates-history KFs (first_seen is the oldest build)
-                    KnownFailure.first_seen_build_id.in_(
-                        select(Build.id).where(
-                            Build.buildkite_build_number == oldest_build_number
-                        )
-                    ) if oldest_build_number is not None else False,
-                )
-            )
+            .where(KnownFailure.status == "open")
             .options(
                 selectinload(KnownFailure.failures).selectinload(Failure.job),
             )
@@ -779,10 +810,19 @@ class TriageService:
                     continue
 
                 # Reassign all Failures pointing to dupe
+                moved_failure_ids = []
                 for f in failures:
                     if f.known_failure_id == dupe.id:
                         f.known_failure_id = keeper.id
+                        moved_failure_ids.append(f.id)
 
+                log_kf_event(
+                    self.session, keeper.id, "dedup_merge",
+                    merged_kf_id=dupe.id,
+                    merged_kf_title=dupe.title,
+                    reason=reason,
+                    failures_moved=moved_failure_ids,
+                )
                 await self.session.delete(dupe)
                 merged_count += 1
                 logger.info(
@@ -805,6 +845,7 @@ class TriageService:
     ) -> list[Failure]:
         """Create Failure records directly from Test Engine structured data (no Claude)."""
         failures: list[Failure] = []
+        failure_event_types: dict[int, str] = {}  # index -> event_type
 
         for ex in executions:
             test_name = ex.get("test_name", "unknown")
@@ -851,6 +892,7 @@ class TriageService:
             if error_signature and effective_category != "infra":
                 is_flaky = await self.pattern_matcher.is_signature_flaky(error_signature)
 
+            tc_event_type = None
             if known_failure_id:
                 # Update last_seen_build
                 kf = await self.session.get(KnownFailure, known_failure_id)
@@ -863,6 +905,7 @@ class TriageService:
                         last_build = lb_result.scalar_one_or_none()
                         if last_build and build.buildkite_build_number > last_build.buildkite_build_number:
                             kf.last_seen_build_id = build.id
+                tc_event_type = "tc_assign"
             else:
                 # Create new KnownFailure
                 title = f"{test_func or test_file_norm}: {error_type}" if error_type != "TestFailure" else f"Test failure in {test_file_norm}"
@@ -879,6 +922,7 @@ class TriageService:
                 self.session.add(kf)
                 await self.session.flush()
                 known_failure_id = kf.id
+                tc_event_type = "tc_create"
 
             failure = Failure(
                 job_id=job.id,
@@ -893,12 +937,27 @@ class TriageService:
                 log_excerpt=log_excerpt,
             )
             self.session.add(failure)
+            failure_event_types[len(failures)] = tc_event_type or "tc_assign"
             failures.append(failure)
 
             if error_signature:
                 await self.pattern_matcher.record_signature(error_signature)
 
         await self.session.flush()
+
+        # Log audit events (after flush so failure IDs are assigned)
+        for idx, failure in enumerate(failures):
+            if failure.known_failure_id:
+                job_name = job.name or job.step_key or "unknown"
+                log_kf_event(
+                    self.session, failure.known_failure_id,
+                    failure_event_types.get(idx, "tc_assign"),
+                    failure_id=failure.id,
+                    job_name=job_name,
+                    test_name=failure.failing_test,
+                    build_number=build.buildkite_build_number,
+                )
+
         return failures
 
     # Common infra failure patterns with canonical titles.
@@ -977,6 +1036,7 @@ class TriageService:
                     known_failure_id = kf.id
                     break
 
+        infra_event_type = "infra_assign"
         if known_failure_id:
             kf = await self.session.get(KnownFailure, known_failure_id)
             if kf:
@@ -989,6 +1049,7 @@ class TriageService:
 
         if not known_failure_id:
             # Create a new infra KnownFailure with a canonical title (no job name)
+            infra_event_type = "infra_create"
             if matched_pattern:
                 title = matched_pattern["title"]
                 summary = matched_pattern["summary"]
@@ -1023,6 +1084,17 @@ class TriageService:
             log_excerpt=log_excerpt or error_message,
         )
         self.session.add(failure)
+        await self.session.flush()
+
+        job_name = job.name or job.step_key or "unknown"
+        log_kf_event(
+            self.session, known_failure_id, infra_event_type,
+            failure_id=failure.id,
+            job_name=job_name,
+            error_type=failure_type,
+            build_number=build.buildkite_build_number,
+        )
+
         return failure
 
     async def _process_individual_failure(
@@ -1047,6 +1119,22 @@ class TriageService:
         log_line_start = analysis.get("log_line_start")
         log_line_end = analysis.get("log_line_end")
 
+        # Enrich failing_test with param info from error_signature when missing.
+        # Claude often returns "test_func" without "[param]" but puts the param
+        # in the signature as "test_file::param_name:ErrorType:detail".
+        error_signature = analysis.get("error_signature")
+        if failing_test_str and error_signature and "[" not in (failing_test_str or ""):
+            # signature format: test_file::param_or_func:ErrorType:detail
+            sig_parts = error_signature.split(":")
+            # Find the part after "::" that isn't the error type
+            if "::" in error_signature:
+                after_colons = error_signature.split("::", 1)[1]
+                sig_func = after_colons.split(":")[0]  # e.g. "compressed_tensors_mixtral_w4a16"
+                # If sig_func differs from the test function name, it's likely a param
+                test_func = failing_test_str.split("::")[-1] if "::" in failing_test_str else ""
+                if sig_func and sig_func != test_func and not sig_func.startswith("test_"):
+                    failing_test_str = f"{failing_test_str}[{sig_func}]"
+
         # Build log excerpt from Claude's line range
         if log_content and log_line_start and log_line_end:
             log_excerpt = self._build_log_excerpt(
@@ -1062,6 +1150,7 @@ class TriageService:
         effective_category = (new_kf_data.get("category") if new_kf_data else None) or analysis.get("category")
 
         known_failure_id = analysis.get("known_failure_id")
+        claude_event_type = "claude_assign"
 
         if known_failure_id:
             kf = await self.session.get(KnownFailure, known_failure_id)
@@ -1095,6 +1184,7 @@ class TriageService:
             is_flaky = await self.pattern_matcher.is_signature_flaky(error_signature)
 
         if not known_failure_id and new_kf_data:
+            claude_event_type = "claude_create"
             title = new_kf_data.get("title", error_message[:200] if error_message else "Unknown failure")
             kf = KnownFailure(
                 title=title,
@@ -1126,6 +1216,17 @@ class TriageService:
 
         if error_signature:
             await self.pattern_matcher.record_signature(error_signature)
+
+        if known_failure_id:
+            job_name = job.name or job.step_key or "unknown"
+            await self.session.flush()
+            log_kf_event(
+                self.session, known_failure_id, claude_event_type,
+                failure_id=failure.id,
+                job_name=job_name,
+                failing_test=failing_test_str,
+                build_number=build.buildkite_build_number,
+            )
 
         return failure
 
@@ -1197,6 +1298,13 @@ class TriageService:
                 if kf:
                     failure.known_failure_id = kf.id
                     kf.last_seen_build_id = build.id
+                    job_name = (await self.session.get(Job, failure.job_id))
+                    log_kf_event(
+                        self.session, kf.id, "retry_assign",
+                        failure_id=failure.id,
+                        job_name=(job_name.name or job_name.step_key or "unknown") if job_name else "unknown",
+                        build_number=build.buildkite_build_number,
+                    )
                     continue
 
             if new_kf_data:
@@ -1214,6 +1322,13 @@ class TriageService:
                 self.session.add(kf)
                 await self.session.flush()
                 failure.known_failure_id = kf.id
+                job_name = (await self.session.get(Job, failure.job_id))
+                log_kf_event(
+                    self.session, kf.id, "retry_create",
+                    failure_id=failure.id,
+                    job_name=(job_name.name or job_name.step_key or "unknown") if job_name else "unknown",
+                    build_number=build.buildkite_build_number,
+                )
 
         assigned_count = sum(1 for f in unassigned if f.known_failure_id is not None)
         logger.info(f"Claude retry assigned {assigned_count}/{len(unassigned)} failures")
@@ -1230,8 +1345,7 @@ class TriageService:
         bracket_idx = failing_test.find('[')
         return failing_test[:bracket_idx] if bracket_idx > 0 else failing_test
 
-    @staticmethod
-    def _assign_same_error_failures(failures: list[Failure]):
+    def _assign_same_error_failures(self, failures: list[Failure]):
         """Auto-assign unassigned failures to the same KF when they share the same error message.
 
         When 14 tests fail with the same OOM error, Claude may assign one but miss the rest.
@@ -1259,6 +1373,12 @@ class TriageService:
             if key in error_to_kf:
                 f.known_failure_id = error_to_kf[key]
                 assigned += 1
+                log_kf_event(
+                    self.session, f.known_failure_id, "auto_assign",
+                    failure_id=f.id,
+                    reason="same_error",
+                    error_key=key[:200],
+                )
                 logger.info(
                     f"Auto-assigned same-error failure to KF#{f.known_failure_id}: {key[:80]}"
                 )
@@ -1266,8 +1386,7 @@ class TriageService:
         if assigned:
             logger.info(f"Auto-assigned {assigned} same-error failure(s)")
 
-    @staticmethod
-    def _assign_sibling_parameterized_failures(failures: list[Failure]):
+    def _assign_sibling_parameterized_failures(self, failures: list[Failure]):
         """Auto-assign unassigned failures to the same KF as an assigned sibling.
 
         When Claude identifies test_func[param_A] as KF#X but misses test_func[param_B],
@@ -1315,6 +1434,12 @@ class TriageService:
                 if func and func in func_to_kf:
                     f.known_failure_id = func_to_kf[func]
                     assigned += 1
+                    log_kf_event(
+                        self.session, f.known_failure_id, "auto_assign",
+                        failure_id=f.id,
+                        reason="sibling_param",
+                        test_func=func,
+                    )
                     logger.info(
                         f"Auto-assigned sibling parameterized test {t} to KF#{f.known_failure_id}"
                     )
@@ -1322,6 +1447,71 @@ class TriageService:
 
         if assigned:
             logger.info(f"Auto-assigned {assigned} sibling parameterized failure(s)")
+
+    async def _auto_create_kfs_for_unassigned(
+        self, failures: list[Failure], build: Build, job_name: str,
+    ):
+        """Safety net: create KnownFailures for failures that remain unassigned after all triage.
+
+        Groups failures by first line of error_message. Each group becomes a new KF.
+        This prevents failures from being permanently orphaned when Claude fails to assign them.
+        """
+        from collections import defaultdict
+
+        groups: dict[str, list[Failure]] = defaultdict(list)
+        for f in failures:
+            if f.known_failure_id is not None:
+                continue
+            key = (f.error_message or "").split('\n')[0].strip()[:200]
+            if not key:
+                key = f"Unknown error in {f.job_name or job_name}"
+            groups[key].append(f)
+
+        for error_key, group in groups.items():
+            # Build a title from the error and job context
+            first = group[0]
+            test_info = ""
+            if first.failing_test:
+                test = first.failing_test
+                if isinstance(test, str) and test.startswith('['):
+                    try:
+                        tests = json.loads(test)
+                        test_info = tests[0] if tests else ""
+                    except json.JSONDecodeError:
+                        test_info = test
+                else:
+                    test_info = test
+            if test_info:
+                title = f"{test_info}: {error_key}"[:200]
+            else:
+                title = error_key[:200]
+
+            category = first.failure_category or "test"
+            kf = KnownFailure(
+                title=title,
+                category=category,
+                summary=f"Auto-created from unassigned failure in {job_name}: {error_key}"[:500],
+                match_prompt=f"Failure in {job_name} with error: {error_key}"[:500],
+                status="open",
+                first_seen_build_id=build.id,
+                last_seen_build_id=build.id,
+            )
+            self.session.add(kf)
+            await self.session.flush()
+
+            for f in group:
+                f.known_failure_id = kf.id
+                log_kf_event(
+                    self.session, kf.id, "auto_create",
+                    failure_id=f.id,
+                    job_name=f.job_name or job_name,
+                    error_key=error_key[:200],
+                    build_number=build.buildkite_build_number,
+                )
+
+            logger.info(
+                f"Auto-created KF#{kf.id} '{title[:80]}' for {len(group)} unassigned failure(s)"
+            )
 
     async def _get_or_create_build(self, build_data: dict) -> Build:
         stmt = (
@@ -1581,9 +1771,13 @@ class TriageService:
         kf_context, _ = await self._load_kf_context(build)
 
         # Save log to temp file for Claude to analyze with tools
+        # Write inside the project so Claude CLI can read them
         import tempfile
+        project_tmp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "tmp")
+        os.makedirs(project_tmp, exist_ok=True)
         log_tmp = tempfile.NamedTemporaryFile(
             prefix=f"triage-{build_number}-", suffix=".log", mode="w", delete=False,
+            dir=project_tmp,
         )
         log_tmp.write(log_content)
         log_tmp.close()
@@ -1614,10 +1808,10 @@ class TriageService:
 
             still_unassigned = [f for f in created_failures if f.known_failure_id is None]
             if still_unassigned:
-                logger.warning(
-                    f"{len(still_unassigned)} failure(s) in job {job.name} "
-                    f"could not be assigned to known failures"
+                await self._auto_create_kfs_for_unassigned(
+                    still_unassigned, build, job.name,
                 )
+                await self.session.flush()
 
             logger.info(f"Triaged job {job.name}: {len(analyses)} failure(s)")
         finally:

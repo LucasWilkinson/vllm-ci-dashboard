@@ -97,7 +97,8 @@ class BuildInTimeline(BaseModel):
 class CommitTimelineEntry(BaseModel):
     commit_sha: str | None = None
     message: str | None = None
-    created_at: datetime | None = None
+    committed_at: datetime | None = None  # git commit time
+    created_at: datetime | None = None    # build/triage time (None if not triaged)
     status: str  # worst aggregate state across builds
     builds: list[BuildInTimeline] = []
     failed_jobs: list[FailedJobSummary] = []

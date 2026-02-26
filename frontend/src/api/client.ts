@@ -124,6 +124,7 @@ export interface FailuresByBuild {
   build_number: number
   build_url: string | null
   commit_sha: string | null
+  committed_at: string | null
   created_at: string | null
   commits_behind: number
   failures: KnownFailureInstance[]
@@ -132,6 +133,7 @@ export interface FailuresByBuild {
 export interface BuildRef {
   build_number: number
   commit_sha: string | null
+  committed_at: string | null
   created_at: string | null
   message: string | null
 }
@@ -166,6 +168,7 @@ export interface BuildInHistory {
 
 export interface BuildHistoryEntry {
   commit_sha: string | null
+  committed_at: string | null
   created_at: string | null
   message: string | null
   status: HistoryStatus  // Aggregate worst status across builds for this commit
@@ -200,7 +203,8 @@ export interface BuildInTimeline {
 export interface CommitTimelineEntry {
   commit_sha: string | null
   message: string | null
-  created_at: string | null
+  committed_at: string | null  // git commit time
+  created_at: string | null    // build/triage time (null if not triaged)
   status: string  // worst aggregate state across builds
   builds: BuildInTimeline[]
   failed_jobs: FailedJobSummary[]
