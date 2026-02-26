@@ -1,18 +1,17 @@
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
-# Use StaticPool with a single shared connection to avoid SQLite locking issues.
-# SQLite only allows one writer at a time; multiple connections from a pool
-# cause "database is locked" errors during long-running triage operations.
+# NullPool creates a fresh connection per request. Combined with WAL mode and
+# busy_timeout, this lets reads proceed while a long-running sync holds a write lock.
 engine = create_async_engine(
     settings.database_url,
     echo=False,
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
+    poolclass=NullPool,
 )
 async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

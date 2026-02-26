@@ -40,14 +40,12 @@ def start_scheduler():
         IntervalTrigger(minutes=15),
         id="sync_builds",
         replace_existing=True,
-        next_run_time=datetime.now(),  # Run immediately on startup
     )
     scheduler.add_job(
         sync_github_issues_job,
         IntervalTrigger(minutes=15),
         id="sync_github_issues",
         replace_existing=True,
-        next_run_time=datetime.now(),  # Run immediately on startup
     )
     scheduler.start()
 

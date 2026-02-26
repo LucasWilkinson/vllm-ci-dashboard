@@ -61,7 +61,6 @@ def _build_failed_job_summaries(build: Build) -> list[FailedJobSummary]:
                     failure_category=failure.failure_category,
                     failure_type=failure.failure_type,
                     failing_test=failing_test,
-                    error_signature=failure.error_signature,
                     error_message=failure.error_message,
                     log_excerpt=failure.log_excerpt,
                     flaky_status=flaky_status,

@@ -2,12 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models import Failure
-from app.schemas.failure import FailureResponse, FailureSuggestion
-from app.services.pattern_matcher import PatternMatcher
+from app.schemas.failure import FailureResponse
 from app.services.triage import TriageService
 
 router = APIRouter()
@@ -19,14 +17,9 @@ class FailureUpdate(BaseModel):
     is_flaky: bool | None = None
 
 
-
 @router.get("/failures/{failure_id}", response_model=FailureResponse)
 async def get_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
-    stmt = (
-        select(Failure)
-        .where(Failure.id == failure_id)
-        .options(selectinload(Failure.issue_links))
-    )
+    stmt = select(Failure).where(Failure.id == failure_id)
     result = await db.execute(stmt)
     failure = result.scalar_one_or_none()
 
@@ -34,16 +27,6 @@ async def get_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Failure not found")
 
     return failure
-
-
-@router.get("/failures/{failure_id}/suggestions", response_model=list[FailureSuggestion])
-async def get_failure_suggestions(
-    failure_id: int,
-    db: AsyncSession = Depends(get_db),
-):
-    pattern_matcher = PatternMatcher(db)
-    suggestions = await pattern_matcher.get_suggestions_for_failure(failure_id)
-    return suggestions
 
 
 @router.patch("/failures/{failure_id}", response_model=FailureResponse)
@@ -90,5 +73,3 @@ async def retriage_failure(failure_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to retriage")
 
     return new_failure
-
-

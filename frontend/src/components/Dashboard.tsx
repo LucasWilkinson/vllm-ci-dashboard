@@ -502,7 +502,7 @@ function CommitTimelineRow({ entry }: { entry: CommitTimelineEntry }) {
                   // Unassigned: group by error message to collapse duplicates
                   const byError: Record<string, FailedJobSummary[]> = {}
                   for (const f of kfFailures) {
-                    const errKey = f.error_message?.split('\n')[0].slice(0, 120) || f.error_signature || 'unknown'
+                    const errKey = f.error_message?.split('\n')[0].slice(0, 120) || 'unknown'
                     if (!byError[errKey]) byError[errKey] = []
                     byError[errKey].push(f)
                   }

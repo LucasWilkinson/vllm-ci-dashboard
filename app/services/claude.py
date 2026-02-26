@@ -85,7 +85,6 @@ Return ONLY valid JSON array (no markdown). Each object has:
 - known_failure_id: <int or null> — set if this matches an existing known failure
 - new_known_failure: {{"title": "...", "summary": "...", "match_prompt": "...", "category": "infra" or "test"}} or null
 - failing_test: Test path (e.g., "v1/test_foo.py::test_bar"). Null for infra issues.
-- error_signature: Format "test_file::test_name:ErrorType:specific_detail" — must be unique
 - error_message: THE DEEPEST ROOT CAUSE error — trace through ALL exception chains
 - root_cause: 1-2 sentence explanation
 - log_line_start: Starting line number for the root cause traceback
@@ -471,7 +470,6 @@ def _fallback_analysis(log_file: str) -> dict:
     """Minimal fallback when Claude analysis fails entirely."""
     return {
         "category": "test",
-        "error_signature": "unknown:fallback_analysis",
         "error_message": f"Claude analysis failed for {log_file}",
         "root_cause": "Log analysis inconclusive",
     }

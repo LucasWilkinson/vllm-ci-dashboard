@@ -54,7 +54,6 @@ class FailedJobSummary(BaseModel):
     failure_category: str | None
     failure_type: str | None
     failing_test: str | list[str] | None = None
-    error_signature: str | None = None
     error_message: str | None
     log_excerpt: str | None = None
     flaky_status: str | None = None

@@ -6,7 +6,6 @@ class FailureBase(BaseModel):
     failure_category: str | None = None
     failure_type: str | None = None
     failing_test: str | list[str] | None = None
-    error_signature: str | None = None
     error_message: str | None = None
     root_cause: str | None = None
     is_flaky: bool | None = False
@@ -30,12 +29,3 @@ class FailureResponse(FailureBase):
             except json.JSONDecodeError:
                 return v
         return v
-
-
-class FailureSuggestion(BaseModel):
-    github_issue_number: int
-    title: str
-    state: str
-    github_issue_url: str
-    similarity_score: float
-    match_reason: str

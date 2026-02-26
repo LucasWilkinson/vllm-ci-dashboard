@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, KnownFailureHistory, BuildHistoryEntry, KnownFailure, KnownFailureInstance, FailuresByBuild, FailureSuggestion, HistoryStatus } from '../api/client'
+import { api, KnownFailureHistory, BuildHistoryEntry, KnownFailure, KnownFailureInstance, FailuresByBuild, HistoryStatus } from '../api/client'
 import LogSnippet from './LogSnippet'
 
 function timeAgo(dateStr: string | null): string {
@@ -435,7 +435,6 @@ export default function KnownFailureDetail() {
   const [issueTitle, setIssueTitle] = useState('')
   const [issueBody, setIssueBody] = useState('')
   const [linking, setLinking] = useState(false)
-  const [linkingSuggestion, setLinkingSuggestion] = useState<number | null>(null)
   const [resolving, setResolving] = useState(false)
   const [unlinking, setUnlinking] = useState(false)
   const [creatingIssue, setCreatingIssue] = useState(false)
@@ -508,20 +507,9 @@ export default function KnownFailureDetail() {
     }
   }, [activeTriages])
 
-  const { data: suggestions } = useQuery<FailureSuggestion[]>({
-    queryKey: ['known-failure-suggestions', knownFailureId],
-    queryFn: async () => {
-      const firstFailureId = kf?.failures_by_build?.[0]?.failures[0]?.failure_id
-      if (!firstFailureId) return []
-      return api.triages.getSuggestions(firstFailureId)
-    },
-    enabled: !!kf && !kf.github_issue && (kf.failures_by_build?.length ?? 0) > 0,
-  })
-
   const refreshData = () => {
     queryClient.invalidateQueries({ queryKey: ['known-failure', knownFailureId] })
     queryClient.invalidateQueries({ queryKey: ['known-failure-history', knownFailureId] })
-    queryClient.invalidateQueries({ queryKey: ['known-failure-suggestions', knownFailureId] })
     queryClient.invalidateQueries({ queryKey: ['known-failures'] })
   }
 
@@ -538,16 +526,6 @@ export default function KnownFailureDetail() {
       refreshData()
     } finally {
       setLinking(false)
-    }
-  }
-
-  const handleLinkSuggestion = async (issueNumber: number) => {
-    setLinkingSuggestion(issueNumber)
-    try {
-      await api.knownFailures.linkIssue(knownFailureId, issueNumber)
-      refreshData()
-    } finally {
-      setLinkingSuggestion(null)
     }
   }
 
@@ -1223,33 +1201,6 @@ export default function KnownFailureDetail() {
           )}
         </div>
 
-        {/* Suggested issues */}
-        {!kf.github_issue && suggestions && suggestions.length > 0 && (
-          <div className="mt-3 pt-3 border-t border-gray-700 space-y-1">
-            <span className="text-xs text-gray-400">Suggested issues:</span>
-            {suggestions.map((s) => (
-              <div key={s.github_issue_number} className="flex items-center gap-2 text-xs ml-2">
-                <a
-                  href={s.github_issue_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={`font-mono ${s.state === 'open' ? 'text-green-400' : 'text-purple-400'} hover:underline`}
-                >
-                  #{s.github_issue_number}
-                </a>
-                <span className="text-gray-400 truncate max-w-[400px]" title={s.title}>{s.title}</span>
-                <span className="text-gray-600">({s.match_reason})</span>
-                <button
-                  onClick={() => handleLinkSuggestion(s.github_issue_number)}
-                  disabled={linkingSuggestion === s.github_issue_number}
-                  className="px-1.5 py-0.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-500 disabled:opacity-50"
-                >
-                  {linkingSuggestion === s.github_issue_number ? '...' : 'Link'}
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
 
       {/* Failure instances by build */}

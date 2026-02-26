@@ -8,13 +8,11 @@ from app.schemas.build import (
 from app.schemas.failure import (
     FailureBase,
     FailureResponse,
-    FailureSuggestion,
 )
 from app.schemas.github import (
     GitHubIssueBase,
     GitHubIssueResponse,
     GitHubIssueCreate,
-    FailureIssueLinkResponse,
 )
 
 __all__ = [
@@ -25,9 +23,7 @@ __all__ = [
     "JobResponse",
     "FailureBase",
     "FailureResponse",
-    "FailureSuggestion",
     "GitHubIssueBase",
     "GitHubIssueResponse",
     "GitHubIssueCreate",
-    "FailureIssueLinkResponse",
 ]

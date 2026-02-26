@@ -16,7 +16,6 @@ from app.services.claude import (
     deduplicate_known_failures,
     resume_claude_session,
 )
-from app.services.pattern_matcher import PatternMatcher
 from app.services.triage_status import triage_status
 
 logger = logging.getLogger(__name__)
@@ -169,7 +168,6 @@ class TriageService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.buildkite = BuildkiteService()
-        self.pattern_matcher = PatternMatcher(session)
 
     async def sync_recent_builds(
         self,
@@ -870,8 +868,6 @@ class TriageService:
                     error_type = last_line.split(":")[0].strip()
                     error_detail = last_line.split(":", 1)[1].strip()[:80]
 
-            error_signature = f"{test_file_norm}::{test_func}:{error_type}:{error_detail}" if test_func else f"{test_file_norm}:{error_type}:{error_detail}"
-
             # Build log excerpt from TC data
             log_excerpt = self._build_tc_log_excerpt(executions, failing_test)
 
@@ -888,15 +884,15 @@ class TriageService:
                 if known_failure_id:
                     break
 
+            # Inherit flaky status from assigned KnownFailure
             is_flaky = False
-            if error_signature and effective_category != "infra":
-                is_flaky = await self.pattern_matcher.is_signature_flaky(error_signature)
 
             tc_event_type = None
             if known_failure_id:
                 # Update last_seen_build
                 kf = await self.session.get(KnownFailure, known_failure_id)
                 if kf:
+                    is_flaky = kf.is_flaky
                     if not kf.last_seen_build_id:
                         kf.last_seen_build_id = build.id
                     else:
@@ -930,7 +926,6 @@ class TriageService:
                 failure_category=effective_category,
                 failure_type="test",
                 failing_test=failing_test,
-                error_signature=error_signature,
                 error_message=f"{error_type}: {error_detail}" if error_detail else error_type,
                 root_cause=failure_reason[-500:] if failure_reason else None,
                 is_flaky=is_flaky,
@@ -939,9 +934,6 @@ class TriageService:
             self.session.add(failure)
             failure_event_types[len(failures)] = tc_event_type or "tc_assign"
             failures.append(failure)
-
-            if error_signature:
-                await self.pattern_matcher.record_signature(error_signature)
 
         await self.session.flush()
 
@@ -1119,22 +1111,6 @@ class TriageService:
         log_line_start = analysis.get("log_line_start")
         log_line_end = analysis.get("log_line_end")
 
-        # Enrich failing_test with param info from error_signature when missing.
-        # Claude often returns "test_func" without "[param]" but puts the param
-        # in the signature as "test_file::param_name:ErrorType:detail".
-        error_signature = analysis.get("error_signature")
-        if failing_test_str and error_signature and "[" not in (failing_test_str or ""):
-            # signature format: test_file::param_or_func:ErrorType:detail
-            sig_parts = error_signature.split(":")
-            # Find the part after "::" that isn't the error type
-            if "::" in error_signature:
-                after_colons = error_signature.split("::", 1)[1]
-                sig_func = after_colons.split(":")[0]  # e.g. "compressed_tensors_mixtral_w4a16"
-                # If sig_func differs from the test function name, it's likely a param
-                test_func = failing_test_str.split("::")[-1] if "::" in failing_test_str else ""
-                if sig_func and sig_func != test_func and not sig_func.startswith("test_"):
-                    failing_test_str = f"{failing_test_str}[{sig_func}]"
-
         # Build log excerpt from Claude's line range
         if log_content and log_line_start and log_line_end:
             log_excerpt = self._build_log_excerpt(
@@ -1145,16 +1121,19 @@ class TriageService:
             log_excerpt = error_message or ""
 
         # Resolve KnownFailure assignment
-        error_signature = analysis.get("error_signature")
         new_kf_data = analysis.get("new_known_failure")
         effective_category = (new_kf_data.get("category") if new_kf_data else None) or analysis.get("category")
 
         known_failure_id = analysis.get("known_failure_id")
         claude_event_type = "claude_assign"
 
+        # Inherit flaky status from assigned KnownFailure
+        is_flaky = False
+
         if known_failure_id:
             kf = await self.session.get(KnownFailure, known_failure_id)
             if kf:
+                is_flaky = kf.is_flaky
                 if not effective_category:
                     effective_category = kf.category
                 # Update last_seen_build if this build is newer
@@ -1179,10 +1158,6 @@ class TriageService:
                 logger.warning(f"Claude assigned KF ID {known_failure_id} not found")
                 known_failure_id = None
 
-        is_flaky = False
-        if error_signature and effective_category != "infra":
-            is_flaky = await self.pattern_matcher.is_signature_flaky(error_signature)
-
         if not known_failure_id and new_kf_data:
             claude_event_type = "claude_create"
             title = new_kf_data.get("title", error_message[:200] if error_message else "Unknown failure")
@@ -1206,16 +1181,12 @@ class TriageService:
             failure_category=effective_category,
             failure_type=analysis.get("failure_type"),
             failing_test=failing_test_str,
-            error_signature=error_signature,
             error_message=error_message,
             root_cause=analysis.get("root_cause"),
             is_flaky=is_flaky,
             log_excerpt=log_excerpt,
         )
         self.session.add(failure)
-
-        if error_signature:
-            await self.pattern_matcher.record_signature(error_signature)
 
         if known_failure_id:
             job_name = job.name or job.step_key or "unknown"
@@ -1241,8 +1212,8 @@ class TriageService:
 
         # Build retry prompt with unassigned failure details
         failure_details = []
-        for f in unassigned:
-            details = f"- error_signature: {f.error_signature or 'none'}"
+        for i, f in enumerate(unassigned):
+            details = f"- failure_index: {i}"
             if f.error_message:
                 details += f"\n  error_message: {f.error_message[:200]}"
             if f.failing_test:
@@ -1257,7 +1228,7 @@ class TriageService:
             "Unassigned failures:\n"
             + "\n".join(failure_details) + "\n\n"
             "Return ONLY a JSON array where each element has:\n"
-            '{"error_signature": "...", "known_failure_id": <int or null>, '
+            '{"failure_index": <int>, "known_failure_id": <int or null>, '
             '"new_known_failure": {"title": "...", "summary": "...", "match_prompt": "...", '
             '"category": "..."} or null}\n'
         )
@@ -1278,15 +1249,11 @@ class TriageService:
             logger.warning(f"Failed to parse Claude resume response: {e}")
             return
 
-        # Build lookup by error_signature
-        unassigned_by_sig = {}
-        for f in unassigned:
-            if f.error_signature:
-                unassigned_by_sig[f.error_signature] = f
-
         for fix in fixes:
-            sig = fix.get("error_signature")
-            failure = unassigned_by_sig.get(sig) if sig else None
+            idx = fix.get("failure_index")
+            if idx is None or idx < 0 or idx >= len(unassigned):
+                continue
+            failure = unassigned[idx]
             if not failure:
                 continue
 
@@ -1625,10 +1592,6 @@ class TriageService:
                 for failure in job.failures:
                     if not failure.retry_passed:
                         failure.retry_passed = True
-                        if failure.error_signature:
-                            await self.pattern_matcher.record_retry_success(
-                                failure.error_signature
-                            )
                         logger.info(f"Retry passed for {job.name} (step_key={step_key})")
                 # Clear retry_pending since we've resolved the outcome
                 job.retry_pending = False

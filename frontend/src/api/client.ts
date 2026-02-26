@@ -25,7 +25,6 @@ export interface FailedJobSummary {
   failure_category: string | null
   failure_type: string | null
   failing_test: string | string[] | null
-  error_signature: string | null
   error_message: string | null
   log_excerpt: string | null
   flaky_status: string | null
@@ -56,7 +55,6 @@ export interface Failure {
   job_id: number
   failure_category: string | null
   failure_type: string | null
-  error_signature: string | null
   error_message: string | null
   root_cause: string | null
   is_flaky: boolean
@@ -90,15 +88,6 @@ export interface Build {
   total_jobs: number
   synced_at: string
   jobs: Job[]
-}
-
-export interface FailureSuggestion {
-  github_issue_number: number
-  title: string
-  state: string
-  github_issue_url: string
-  similarity_score: number
-  match_reason: string
 }
 
 export interface GitHubIssue {
@@ -236,8 +225,6 @@ export const api = {
       fetchApi<CommitTimelineEntry[]>(`/builds/timeline?${new URLSearchParams(cleanParams(params))}`),
   },
   triages: {
-    getSuggestions: (failureId: number) =>
-      fetchApi<FailureSuggestion[]>(`/triages/failures/${failureId}/suggestions`),
     updateFailure: (failureId: number, update: { failure_category?: string; failure_type?: string; is_flaky?: boolean }) =>
       fetchApi<Failure>(`/triages/failures/${failureId}`, {
         method: 'PATCH',
@@ -253,15 +240,6 @@ export const api = {
       fetchApi<GitHubIssue>(`/issues/failures/${failureId}/create`, {
         method: 'POST',
         body: JSON.stringify(data),
-      }),
-    linkToFailure: (failureId: number, issueNumber: number) =>
-      fetchApi<unknown>(`/issues/failures/${failureId}/link`, {
-        method: 'POST',
-        body: JSON.stringify({ github_issue_number: issueNumber }),
-      }),
-    unlinkFromFailure: (failureId: number, issueNumber: number) =>
-      fetchApi<{ message: string }>(`/issues/failures/${failureId}/unlink/${issueNumber}`, {
-        method: 'DELETE',
       }),
   },
   knownFailures: {

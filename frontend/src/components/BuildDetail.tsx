@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api, Build, Job, FailureSuggestion } from '../api/client'
+import { api, Build, Job } from '../api/client'
 import LogSnippet from './LogSnippet'
 
 function CategoryBadge({ category }: { category: string | null }) {
@@ -33,71 +33,6 @@ function StateBadge({ state }: { state: string | null }) {
     <span className={`px-2 py-0.5 rounded text-xs ${colors[state || ''] || colors.pending}`}>
       {state || 'unknown'}
     </span>
-  )
-}
-
-function IssueBadge({ state }: { state: string }) {
-  const isOpen = state === 'open' || state === 'OPEN'
-  return (
-    <span
-      className={`px-2 py-0.5 rounded text-xs ${
-        isOpen ? 'bg-github-green text-white' : 'bg-github-purple text-white'
-      }`}
-    >
-      {state}
-    </span>
-  )
-}
-
-function SuggestionsPanel({ failureId }: { failureId: number }) {
-  const { data: suggestions, isLoading } = useQuery<FailureSuggestion[]>({
-    queryKey: ['suggestions', failureId],
-    queryFn: () => api.triages.getSuggestions(failureId),
-  })
-
-  const linkMutation = useMutation({
-    mutationFn: (issueNumber: number) => api.issues.linkToFailure(failureId, issueNumber),
-  })
-
-  if (isLoading) return <div className="text-gray-500 text-sm">Loading suggestions...</div>
-  if (!suggestions?.length) return <div className="text-gray-500 text-sm">No similar issues found</div>
-
-  return (
-    <div className="space-y-2">
-      <h4 className="text-sm font-medium text-gray-400">Similar Issues</h4>
-      {suggestions.map((suggestion) => (
-        <div
-          key={suggestion.github_issue_number}
-          className="bg-gray-700 rounded p-3 flex items-center justify-between"
-        >
-          <div className="flex-1">
-            <div className="flex items-center space-x-2">
-              <a
-                href={suggestion.github_issue_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-blue-400 hover:underline"
-              >
-                #{suggestion.github_issue_number}
-              </a>
-              <IssueBadge state={suggestion.state} />
-              <span className="text-gray-400 text-sm">
-                {Math.round(suggestion.similarity_score * 100)}% match
-              </span>
-            </div>
-            <div className="text-gray-300 text-sm mt-1 truncate">{suggestion.title}</div>
-            <div className="text-gray-500 text-xs">{suggestion.match_reason}</div>
-          </div>
-          <button
-            onClick={() => linkMutation.mutate(suggestion.github_issue_number)}
-            disabled={linkMutation.isPending}
-            className="px-3 py-1 bg-gray-600 text-gray-200 rounded text-sm hover:bg-gray-500 disabled:opacity-50"
-          >
-            Link
-          </button>
-        </div>
-      ))}
-    </div>
   )
 }
 
@@ -260,7 +195,6 @@ function JobCard({ job, buildNumber }: { job: Job; buildNumber: number }) {
                 </div>
               )}
 
-              <SuggestionsPanel failureId={failure.id} />
             </div>
           ))}
 
