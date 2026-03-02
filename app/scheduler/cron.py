@@ -4,10 +4,6 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.database import async_session_maker, get_db_session
-from app.services.triage import TriageService
-from app.services.github import GitHubService
-
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
@@ -16,7 +12,16 @@ _sync_lock = asyncio.Lock()
 
 
 async def _do_sync_builds():
-    """Run build sync with a fresh session per build so we don't starve the event loop."""
+    """Run build sync on the main event loop, yielding between builds.
+
+    Uses a fresh DB session per build and limits triage to 3 failed builds
+    per cycle to avoid blocking the event loop for too long.
+    """
+    from sqlalchemy import select
+    from app.database import get_db_session
+    from app.models import Build
+    from app.services.triage import TriageService
+
     if _sync_lock.locked():
         logger.info("Sync already in progress, skipping scheduled run")
         return
@@ -28,9 +33,6 @@ async def _do_sync_builds():
             builds_data = await triage.buildkite.list_recent_builds(
                 limit=20, branch="main", nightly_daily_only=False
             )
-
-            from sqlalchemy import select
-            from app.models import Build
 
             stmt = select(Build.buildkite_build_number).where(
                 Build.state.in_(["running", "scheduled"])
@@ -50,28 +52,45 @@ async def _do_sync_builds():
 
         synced = 0
         triaged = 0
+        max_triage_per_cycle = 3  # Limit Claude-heavy triage to avoid long blocking
+
         for build_data in builds_data:
             build_num = build_data.get("number", "?")
+            state = build_data.get("state", "")
             try:
-                async with get_db_session() as session:
-                    triage = TriageService(session)
-                    state = build_data.get("state", "")
-                    if state in ("failed", "failing"):
+                # Skip triage if we've hit the per-cycle limit
+                if state in ("failed", "failing") and triaged >= max_triage_per_cycle:
+                    logger.info(f"Skipping triage for build #{build_num} (hit per-cycle limit)")
+                    # Still sync the build metadata/jobs, just don't triage
+                    async with get_db_session() as session:
+                        triage = TriageService(session)
+                        build = await triage._get_or_create_build(build_data)
+                        full_build = await triage.buildkite.get_build(build_data["number"])
+                        await triage._sync_jobs(build, full_build.get("jobs", []))
+                        synced += 1
+                        await session.commit()
+                elif state in ("failed", "failing"):
+                    async with get_db_session() as session:
+                        triage = TriageService(session)
                         await triage.sync_and_triage_build(build_data)
                         triaged += 1
-                    else:
+                        synced += 1
+                        await session.commit()
+                else:
+                    async with get_db_session() as session:
+                        triage = TriageService(session)
                         build = await triage._get_or_create_build(build_data)
                         full_build = await triage.buildkite.get_build(build_data["number"])
                         await triage._sync_jobs(build, full_build.get("jobs", []))
                         await triage._auto_resolve_known_failures(build)
-                    synced += 1
-                    await session.commit()
+                        synced += 1
+                        await session.commit()
                 logger.info(f"Synced build #{build_num} ({synced}/{len(builds_data)})")
             except Exception as e:
                 logger.error(f"Failed to sync build #{build_num}: {e}")
                 continue
             # Yield to event loop between builds so HTTP requests can be served
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
 
         logger.info(f"Scheduled sync complete: synced {synced}, triaged {triaged}")
 
@@ -82,6 +101,9 @@ async def sync_builds_job():
 
 
 async def sync_github_issues_job():
+    from app.database import get_db_session
+    from app.services.github import GitHubService
+
     async with get_db_session() as session:
         github_service = GitHubService(session)
         await github_service.sync_issue_states()

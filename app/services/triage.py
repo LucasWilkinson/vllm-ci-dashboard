@@ -1431,7 +1431,7 @@ class TriageService:
                 continue
             key = (f.error_message or "").split('\n')[0].strip()[:200]
             if not key:
-                key = f"Unknown error in {f.job_name or job_name}"
+                key = f"Unknown error in {job_name}"
             groups[key].append(f)
 
         for error_key, group in groups.items():
@@ -1471,7 +1471,7 @@ class TriageService:
                 log_kf_event(
                     self.session, kf.id, "auto_create",
                     failure_id=f.id,
-                    job_name=f.job_name or job_name,
+                    job_name=job_name,
                     error_key=error_key[:200],
                     build_number=build.buildkite_build_number,
                 )
